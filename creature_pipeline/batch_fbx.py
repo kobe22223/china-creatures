@@ -18,7 +18,7 @@ BATCHES = {
     "China14_Z11": ["vermilionbird", "fenghuang", "peng", "azuredragon"],
     "China15_Special": ["nian", "goldenemperordragon"],
 }
-only = [a for a in sys.argv[1:] if a.startswith("Batch")]
+only = [a for a in sys.argv[1:] if a.startswith(("Batch", "China"))]
 if only:
     BATCHES = {k: v for k, v in BATCHES.items() if k in only}
 outdir = os.path.join(HERE, "out", "batches")

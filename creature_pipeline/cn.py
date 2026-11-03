@@ -107,9 +107,10 @@ def coin(c, ctr, r, bone, facing=(0, 0, -1), col=GOLD, hole=C(120, 70, 20), glow
     fb = P(f.x, f.y, f.z)
     ax = Vector((0, 1, 0)).rotation_difference(Vector((f.x, f.y, f.z))).to_matrix()
     rot = G @ ax @ G
+    bl = list(bone) if isinstance(bone, (list, tuple)) else [bone]
     if backing:
-        c.tube([ctr - fb * r * 0.25, ctr - fb * r * 0.02], [r * 1.35, r * 1.35], backing, [bone], seg=20, sub=1)
-    c.tube([ctr - fb * r * 0.1, ctr + fb * r * 0.12], [r, r], col, [bone], seg=20, sub=1, stud=False, glow=glow)
+        c.tube([ctr - fb * r * 0.25, ctr - fb * r * 0.02], [r * 1.35, r * 1.35], backing, bl, seg=20, sub=1)
+    c.tube([ctr - fb * r * 0.1, ctr + fb * r * 0.12], [r, r], col, bl, seg=20, sub=1, stud=False, glow=glow)
     c.torus(ctr + fb * r * 0.12, r * 0.88, r * 0.12, col, bone, rot=rot, seg=(20, 5), stud=False, glow=glow)
     c.box(ctr + fb * r * 0.13, (r * 0.26, r * 0.26, r * 0.26), hole, bone, rot=rot, stud=False)
 
@@ -149,3 +150,49 @@ def cloud_filigree(col, scale=1.2, width=0.08, only=None):
     """cloud swirl trim paint for royal creatures (wrapper so creature files only import cn)"""
     from detail import filigree
     return filigree(col, scale=scale, width=width, only=only)
+
+
+# ============================================================== FIERCE / GUARDIAN QUADRUPED
+def fierce_quad(c, col, belly=None, sh=4.4, hip=None, L=2.0, W=1.3, neck=(0.9, 0.8), head=1.6, tail=3, tail_len=0.9,
+                body_r=1.45, leg_r=(0.8, 0.62, 0.52), paw=(0.72, 0.4, 0.9), paw_col=None, paint=None, belly_paint=None,
+                hump=0.25):
+    """heavy guardian body on detail.beast: thick barrel, muscular legs (about 35-45% of height), wide stance.
+    Returns the beast key dict (+ 'body_r'). Head shapes are left to the creature."""
+    from detail import beast, leg, T, E, V
+    k = beast(c, sh=sh, hip=hip, L=L, W=W, neck=neck, head=head, tail=tail, tail_len=tail_len, tail_lift=0.15)
+    sh, hip, cz, hz, mid = k["sh"], k["hip"], k["cz"], k["hz"], k["mid"]
+    TB = ["Hips", "Chest"]
+    r = body_r
+    T(c, [V(0, hip, hz + 0.9), V(0, hip + 0.1, hz), V(0, mid.y + hump * 0.5, 0), V(0, sh + hump, cz + 0.2), V(0, sh + 0.2, cz - 0.6)],
+      [r * 0.7, r * 0.98, r * 1.04, r * 1.1, r * 0.85], col, TB, seg=10, paint=paint)
+    E(c, V(0, mid.y - r * 0.5, -0.2), (r * 0.78, r * 0.48, L * 1.05), belly or col, TB, seg=(10, 7), paint=belly_paint)
+    T(c, [V(0, sh, cz), k["nb"], k["hb"] + V(0, -0.1, 0.25)], [r * 0.9, r * 0.78, r * 0.64], col, ["Chest", "Neck"], seg=9, paint=paint)
+    for s, X in ((-1, "L"), (1, "R")):
+        for front in (True, False):
+            leg(c, k, X, col, r=leg_r, paw_col=paw_col or col, paw=paw, front=front, paint=paint)
+    k["body_r"] = r
+    return k
+
+
+def hoof(c, f, r, col, bone):
+    """split hoof around a foot point (game Vector)"""
+    from detail import E, V
+    for s in (-1, 1):
+        E(c, f + V(s * r * 0.42, -0.08, -r * 0.45), (r * 0.48, r * 0.42, r * 0.62), col, bone, seg=(8, 5), stud=False)
+
+
+def fierce_anims(c, tail=3, stride=24, bob=0.14, head_amp=0.8, roar=True, extra=None):
+    """heavy quad walk + idle with a roar (Jaw) beat"""
+    def ex(t, walking):
+        p = tau * t
+        out = {}
+        if walking:
+            out = {"Jaw": (-3 - 4 * max(0, sin(2 * p)), 0, 0)} if roar else {}
+        elif roar:
+            rr = max(0, sin(math.pi * (t - 0.5) / 0.32)) if 0.5 <= t <= 0.82 else 0.0
+            out = {"Jaw": (-3 - 24 * rr, 0, 0), "Head": (12 * rr + 3 * sin(2 * p), 0, 4 * sin(p) * (1 - rr)),
+                   "Neck": (2 * sin(p) + 6 * rr, 12 * sin(p) * (1 - rr), 0)}
+        if extra:
+            out.update(extra(t, walking))
+        return out
+    quad_anims(c, tail=tail, stride=stride, bob=bob, head_amp=head_amp, extra=ex)
