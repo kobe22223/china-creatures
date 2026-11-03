@@ -196,3 +196,32 @@ def fierce_anims(c, tail=3, stride=24, bob=0.14, head_amp=0.8, roar=True, extra=
             out.update(extra(t, walking))
         return out
     quad_anims(c, tail=tail, stride=stride, bob=bob, head_amp=head_amp, extra=ex)
+
+
+# ============================================================== PATTERNS / FLUFF
+def panda_paint(col, leg_top, shoulder_z, band=0.6, band_lo=None):
+    """panda pattern: black legs (below leg_top) + a black band over the shoulders around z = shoulder_z"""
+    def mask(X, Y, Z):
+        m = Y < leg_top
+        sb = np.abs(Z - shoulder_z) < band
+        if band_lo is not None:
+            sb &= Y > band_lo
+        return m | sb
+    return (col, mask)
+
+
+def puffs(c, ctr, rad, col, bones, n=40, size=0.42, where=None, seed=3, sink=0.45, col2=None, mix=0.3, paint=None):
+    """cover an ellipsoid with round fluffy puffs (silkie feathers, clouds, manes). ctr = P() point, rad = game radii"""
+    import random as _r
+    rng = _r.Random(seed)
+    ga = math.pi * (3 - math.sqrt(5))
+    for i in range(n):
+        y = 1 - 2 * (i + 0.5) / n
+        rr = math.sqrt(max(0, 1 - y * y))
+        u = (math.cos(ga * i) * rr, y, math.sin(ga * i) * rr)
+        if where and not where(u):
+            continue
+        s = size * (1 + rng.uniform(-0.2, 0.2))
+        p = ctr + P(u[0] * (rad[0] - s * sink), u[1] * (rad[1] - s * sink), u[2] * (rad[2] - s * sink))
+        cc = col2 if (col2 is not None and rng.random() < mix) else col
+        c.ellipsoid(p, (s, s * 0.9, s), cc, bones, seg=(10, 7), paint=paint)
