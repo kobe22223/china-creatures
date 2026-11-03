@@ -1,0 +1,6 @@
+__pycache__/
+creature_pipeline/out/*
+!creature_pipeline/out/sheets/
+!creature_pipeline/out/batches/
+!creature_pipeline/out/textures/
+!creature_pipeline/out/CreatureData.rbxmx
