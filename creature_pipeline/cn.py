@@ -181,7 +181,7 @@ def hoof(c, f, r, col, bone):
         E(c, f + V(s * r * 0.42, -0.08, -r * 0.45), (r * 0.48, r * 0.42, r * 0.62), col, bone, seg=(8, 5), stud=False)
 
 
-def fierce_anims(c, tail=3, stride=24, bob=0.14, head_amp=0.8, roar=True, extra=None):
+def fierce_anims(c, tail=3, stride=24, bob=0.14, head_amp=0.8, roar=True, extra=None, wings=False):
     """heavy quad walk + idle with a roar (Jaw) beat"""
     def ex(t, walking):
         p = tau * t
@@ -195,7 +195,7 @@ def fierce_anims(c, tail=3, stride=24, bob=0.14, head_amp=0.8, roar=True, extra=
         if extra:
             out.update(extra(t, walking))
         return out
-    quad_anims(c, tail=tail, stride=stride, bob=bob, head_amp=head_amp, extra=ex)
+    quad_anims(c, wings=wings, tail=tail, stride=stride, bob=bob, head_amp=head_amp, extra=ex)
 
 
 # ============================================================== PATTERNS / FLUFF
@@ -245,3 +245,47 @@ def cute_swimmer(c, y0=2.2, head_r=1.1, body=(1.0, 1.0, 1.3), length=4.2, n=4, f
 
 def swimmer_anims(c, chain, amp=10, axis="yaw", hover=0.35, fins=True, extra=None):
     swim_anims(c, chain, fins=[("FinL", -1), ("FinR", 1)] if fins else (), amp=amp, axis=axis, hover=hover, extra=extra)
+
+
+# ============================================================== DRAGON HEAD (shared by every dragon-like creature)
+def dragon_head(c, hb, s, col, belly, horn, whisk, mane, glow, bone="Head", jaw=None, horns="antler", teeth=True,
+                mane_n=4, seed=1, core=C(255, 250, 220), brow=None, snout=1.0, beard=None):
+    """Chinese dragon head in game space. hb = back of the skull (detail.V), s = scale, front = -z.
+    horns: 'antler' (branched deer horns), 'swept' (smooth back-swept), 'one' (single horn), None.
+    jaw = bone for the lower jaw (defaults to the head bone). Returns key points."""
+    from detail import E, T, S, V, maw, eyes_pair, fur_line, swept_horn
+    jaw = jaw or bone
+    E(c, hb + V(0, 0.15 * s, -0.55 * s), (0.95 * s, 0.85 * s, 1.0 * s), col, bone, seg=(12, 9))
+    sn = snout
+    T(c, [hb + V(0, 0.1 * s, -0.95 * s), hb + V(0, -0.02 * s, -1.7 * s * sn), hb + V(0, -0.08 * s, -2.25 * s * sn)],
+      [0.72 * s, 0.56 * s, 0.46 * s], col, bone, seg=10, flat=(1.0, 0.85))
+    E(c, hb + V(0, 0.02 * s, -2.32 * s * sn), (0.48 * s, 0.34 * s, 0.28 * s), col, bone, seg=(10, 7))
+    for sx in (-1, 1):
+        E(c, hb + V(sx * 0.2 * s, 0.12 * s, -2.55 * s * sn), (0.1 * s, 0.08 * s, 0.06 * s), C(30, 20, 20), bone, stud=False)
+        S(c, hb + V(sx * 0.45 * s, 0.6 * s, -1.25 * s), hb + V(sx * 0.62 * s, 0.85 * s, -0.55 * s), 0.18 * s, brow or col, bone, seg=4, n=3)
+    E(c, hb + V(0, -0.55 * s, -1.55 * s * sn), (0.5 * s, 0.18 * s, 0.85 * s * sn), belly, jaw, seg=(10, 6))
+    if teeth:
+        maw(c, hb + V(0, -0.35 * s, -2.2 * s * sn), 0.42 * s, 1.0 * s * sn, 0.36 * s, bone, jaw, n=8, tooth=0.12 * s, fangs=1.8)
+    eyes_pair(c, hb + V(0, 0.45 * s, -1.05 * s), 0.46 * s, 0.22 * s, bone, glow=glow, core=core, brow=brow or col, slant=22, turn=0.6)
+    for sx in (-1, 1):
+        b0 = hb + V(sx * 0.42 * s, 0.75 * s, -0.25 * s)
+        if horns == "antler":
+            main = [b0, b0 + V(sx * 0.2 * s, 0.6 * s, 0.35 * s), b0 + V(sx * 0.35 * s, 1.0 * s, 1.0 * s), b0 + V(sx * 0.4 * s, 1.2 * s, 1.55 * s)]
+            swept_horn(c, main, 0.2 * s, horn, bone, seg=6)
+            swept_horn(c, [main[1].lerp(main[2], 0.4), main[1].lerp(main[2], 0.4) + V(sx * 0.15 * s, 0.6 * s, -0.1 * s)], 0.12 * s, horn, bone, seg=5)
+        elif horns == "swept":
+            swept_horn(c, [b0, b0 + V(sx * 0.15 * s, 0.45 * s, 0.6 * s), b0 + V(sx * 0.25 * s, 0.7 * s, 1.4 * s)], 0.24 * s, horn, bone, seg=6, ribs=True)
+        # whiskers trailing back from the snout
+        T(c, [hb + V(sx * 0.38 * s, -0.05 * s, -2.15 * s * sn), hb + V(sx * 0.95 * s, -0.12 * s, -1.95 * s * sn),
+              hb + V(sx * 1.5 * s, -0.5 * s, -1.4 * s), hb + V(sx * 1.75 * s, -0.95 * s, -0.85 * s)],
+          [0.09 * s, 0.07 * s, 0.05 * s, 0.03 * s], whisk, bone, seg=5)
+    if horns == "one":
+        swept_horn(c, [hb + V(0, 0.8 * s, -0.7 * s), hb + V(0, 1.45 * s, -0.8 * s), hb + V(0, 1.9 * s, -0.55 * s)], 0.24 * s, horn, bone, seg=6, ribs=True)
+    # mane: shard fur fringe framing the back of the skull and cheeks
+    if mane is not None:
+        pts = [hb + V(-0.9 * s, -0.4 * s, -0.4 * s), hb + V(-0.85 * s, 0.6 * s, 0.0), hb + V(0, 1.0 * s, 0.25 * s),
+               hb + V(0.85 * s, 0.6 * s, 0.0), hb + V(0.9 * s, -0.4 * s, -0.4 * s)]
+        fur_line(c, pts, mane, bone, length=0.9 * s, width=0.55 * s, out=lambda p: (p - hb).normalized() + V(0, 0, 0.9), n_per=mane_n, seed=seed)
+    if beard is not None:
+        fur_line(c, [hb + V(-0.35 * s, -0.75 * s, -1.4 * s), hb + V(0.35 * s, -0.75 * s, -1.4 * s)], beard, jaw, length=0.7 * s, width=0.4 * s, out=V(0, -1, 0.2), n_per=4, seed=seed + 1)
+    return dict(nose=hb + V(0, 0, -2.4 * s * sn), top=hb + V(0, 0.9 * s, -0.5 * s))
