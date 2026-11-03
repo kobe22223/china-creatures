@@ -9,7 +9,13 @@ RY180 = Matrix(((-1, 0, 0), (0, 1, 0), (0, 0, -1)))
 src = open(os.path.join(HERE, "batch_fbx.py")).read()
 BATCHES = eval(src[src.index("BATCHES = {") + 10: src.index("}\nonly") + 1])
 items = []
+def built(cid):
+    d = f"{HERE}/out/{cid}"
+    return os.path.isdir(d) and any(f.endswith("_data.json") for f in os.listdir(d))
 for bname, ids in BATCHES.items():
+    if not all(built(i) for i in ids):
+        print("SKIP", bname)
+        continue
     for i, cid in enumerate(ids):
         name, rest = restcf.rest(cid)
         dj = [f for f in os.listdir(f"{HERE}/out/{cid}") if f.endswith("_data.json")][0]
