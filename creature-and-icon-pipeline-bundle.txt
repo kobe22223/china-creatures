@@ -1,0 +1,2468 @@
+STEAL-AN-EGG TEMPLATE: CREATURE + ICON PIPELINE SOURCE BUNDLE
+================================================================
+Python source used to make the sculpted, studded, rigged + animated creature meshes and the cartoon UI
+icons for "+1 Superpower for an Egg". Read the main doc (steal-egg-template-context.md, section 9) first.
+
+UNPACK: save this file as bundle.txt in a NEW empty folder, then run:
+
+python3 -I - bundle.txt <<'PY'
+import sys, os, re
+txt = open(sys.argv[1]).read()
+parts = re.split(r"^##### FILE: (.+?) #####$", txt, flags=re.M)
+for i in range(1, len(parts), 2):
+    path, body = parts[i].strip(), parts[i + 1].lstrip("\n")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    open(path, "w").write(body)
+    print("wrote", path)
+PY
+
+Needs: pip install bpy (Blender 5.x as a Python module, works headless in the cloud container), numpy, pillow, cairosvg.
+Then: cd creature_pipeline && python3 make.py moonbunny --render --export   (renders out/moonbunny/*.png + FBX)
+
+##### FILE: creature_pipeline/sculpt.py #####
+"""Sculpting toolkit for studded creature meshes (bpy).
+
+Write creatures in "game" coordinates: P(x, y, z) with y = up and z = backwards (the creature's
+front points to -z), like Roblox. Internally Blender is Z-up with the front at -Y.
+
+Every shape belongs to one or more bones (rigid or blended weights), has a colour, and flags:
+  stud=False  -> no stud pattern (eyes, mouth, gems)
+  glow=True   -> exported as a separate "Glow_*" mesh that Roblox renders as Neon
+The final mesh is UV-unwrapped and gets a baked texture: flat colours + shading + studs.
+"""
+import math, json, os, random
+import bpy, bmesh
+import numpy as np
+from mathutils import Vector, Matrix, Euler, Quaternion
+from PIL import Image, ImageDraw, ImageFilter
+
+
+# game (x right, y up, z back) -> blender: a proper rotation, matching the FBX export axes
+# (blender -Y forward / Z up -> FBX -Z forward / Y up), so game x = -blender x.
+G = Matrix(((-1, 0, 0), (0, 0, 1), (0, 1, 0)))
+
+
+def P(x, y, z):
+    return Vector((-x, z, y))
+
+
+def C(r, g, b):
+    return (r / 255, g / 255, b / 255)
+
+
+def euler(rx=0, ry=0, rz=0):
+    """rotation given in game axes (degrees), returned as a blender-space matrix"""
+    return G @ Euler((math.radians(rx), math.radians(ry), math.radians(rz)), "XYZ").to_matrix() @ G
+
+
+STUD_SCALE = 0.55
+
+
+class Creature:
+    def __init__(self, name, height=9.0, stud=None):
+        self.name = name
+        self.height = height
+        self.stud = (stud or height / 30) * STUD_SCALE   # owner asked for denser studs
+        self.bones = []          # (name, head, tail, parent)
+        self.shapes = []         # dicts: bm, color, bones, glow, stud
+        self.palette = []
+        self.anim_spec = {}
+        self.extra = {}
+
+    # ---------------------------------------------------------------- skeleton
+    def bn(self, n):
+        """exported bone name: unique per creature (Roblox's importer merges same-named bones across a batch)"""
+        return self.name + "__" + n
+
+    def bone(self, name, head, tail, parent=None):
+        self.bones.append((name, Vector(head), Vector(tail), parent))
+        return name
+
+    def bone_pos(self, name, end="head"):
+        for n, h, t, p in self.bones:
+            if n == name:
+                return h if end == "head" else t
+        raise KeyError(name)
+
+    # ---------------------------------------------------------------- shapes
+    def _add(self, bm, color, bones, glow=False, stud=True, smooth=False, paint=None):
+        """paint = fn(x, y, z game coords of a face centre) -> colour or None (painted patterns: stripes, spots)"""
+        self.shapes.append(dict(bm=bm, color=tuple(color), bones=bones if isinstance(bones, (list, tuple)) else [bones],
+                                glow=glow, stud=stud and not glow, smooth=smooth, paint=paint))
+        return bm
+
+    def ellipsoid(self, center, radii, color, bones, rot=None, seg=(14, 9), **kw):
+        bm = bmesh.new()
+        bmesh.ops.create_uvsphere(bm, u_segments=seg[0], v_segments=seg[1], radius=1.0)
+        m = Matrix.Diagonal((radii[0], radii[2], radii[1], 1.0))  # game (x,y,z) radii -> blender (x,z,y)
+        if rot is not None:
+            m = rot.to_4x4() @ m
+        m = Matrix.Translation(center) @ m
+        bmesh.ops.transform(bm, matrix=m, verts=bm.verts)
+        return self._add(bm, color, bones, **kw)
+
+    def tube(self, points, radii, color, bones, seg=10, cap=True, flat=None, sub=3, **kw):
+        """tapered tube through points (Vectors) with per-point radius. flat = (sx, sy) squash of the
+        cross-section (sx along the 'side' axis, sy along the 'up-ish' axis). sub = smooth subdivision."""
+        if sub > 1 and len(points) >= 3:
+            pts2, rad2 = [], []
+            n0 = len(points)
+            for i in range(n0 - 1):
+                p0, p1, p2, p3 = points[max(i - 1, 0)], points[i], points[i + 1], points[min(i + 2, n0 - 1)]
+                for k in range(sub):
+                    t = k / sub
+                    t2, t3 = t * t, t * t * t
+                    pts2.append(0.5 * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3))
+                    rad2.append(radii[i] + (radii[i + 1] - radii[i]) * t)
+            pts2.append(points[-1]); rad2.append(radii[-1])
+            points, radii = pts2, rad2
+        bm = bmesh.new()
+        rings = []
+        n = len(points)
+        up_hint = Vector((0, 0, 1))
+        for i, p in enumerate(points):
+            d = (points[min(i + 1, n - 1)] - points[max(i - 1, 0)]).normalized()
+            side = d.cross(up_hint)
+            if side.length < 1e-3:
+                side = d.cross(Vector((1, 0, 0)))
+            side.normalize()
+            up = side.cross(d).normalized()
+            r = radii[i]
+            sx, sy = flat or (1, 1)
+            ring = []
+            for k in range(seg):
+                a = k / seg * math.tau
+                ring.append(bm.verts.new(p + side * math.cos(a) * r * sx + up * math.sin(a) * r * sy))
+            rings.append(ring)
+        for i in range(n - 1):
+            for k in range(seg):
+                a, b = rings[i][k], rings[i][(k + 1) % seg]
+                c, d2 = rings[i + 1][(k + 1) % seg], rings[i + 1][k]
+                bm.faces.new((a, b, c, d2))
+        if cap:
+            for ring, pt, sign in ((rings[0], points[0], -1), (rings[-1], points[-1], 1)):
+                dirv = (points[1] - points[0]) if sign < 0 else (points[-1] - points[-2])
+                tip = bm.verts.new(pt + dirv.normalized() * radii[0 if sign < 0 else -1] * 0.35 * sign)
+                for k in range(seg):
+                    v1, v2 = ring[k], ring[(k + 1) % seg]
+                    if sign < 0:
+                        bm.faces.new((v2, v1, tip))
+                    else:
+                        bm.faces.new((v1, v2, tip))
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+        return self._add(bm, color, bones, **kw)
+
+    def curve_points(self, a, b, bend=Vector((0, 0, 0)), n=6):
+        """quadratic curve from a to b, bulging by `bend` at the middle"""
+        pts = []
+        for i in range(n):
+            t = i / (n - 1)
+            pts.append(a.lerp(b, t) + bend * (4 * t * (1 - t)))
+        return pts
+
+    def spike(self, base, tip, r, color, bones, bend=None, seg=7, n=5, **kw):
+        pts = self.curve_points(base, tip, bend or Vector((0, 0, 0)), n)
+        radii = [r * (1 - i / (n - 1)) ** 1.1 + 0.02 for i in range(n)]
+        return self.tube(pts, radii, color, bones, seg=seg, **kw)
+
+    def leaf(self, origin, along, width_dir, length, width, color, bones, thick=0.12, n=7, shape="feather", curl=0.0, **kw):
+        """flat shape (feather, fin, ear, flame, membrane) with thickness"""
+        along = along.normalized()
+        width_dir = (width_dir - along * width_dir.dot(along)).normalized()
+        normal = along.cross(width_dir).normalized()
+        top, bot = [], []
+        prof = []
+        for i in range(n):
+            t = i / (n - 1)
+            if shape == "feather":
+                w = math.sin(math.pi * min(1, t * 1.15)) ** 0.7 * (1 - 0.35 * t)
+            elif shape == "flame":
+                w = math.sin(math.pi * t) ** 0.6 * (1 - t) ** 0.5 * 1.4
+            elif shape == "fin":
+                w = (1 - t) ** 0.8
+            else:  # ear / blade
+                w = math.sin(math.pi * (0.5 + 0.5 * t)) if t > 0 else 1
+            prof.append(max(w, 0.02))
+        bm = bmesh.new()
+        for i, w in enumerate(prof):
+            t = i / (n - 1)
+            c = origin + along * (t * length) + normal * (curl * t * t * length)
+            for s in (-1, 1):
+                for h in (-1, 1):
+                    pass
+            top.append((bm.verts.new(c - width_dir * w * width / 2 + normal * thick / 2), bm.verts.new(c + width_dir * w * width / 2 + normal * thick / 2)))
+            bot.append((bm.verts.new(c - width_dir * w * width / 2 - normal * thick / 2), bm.verts.new(c + width_dir * w * width / 2 - normal * thick / 2)))
+        for i in range(n - 1):
+            bm.faces.new((top[i][0], top[i][1], top[i + 1][1], top[i + 1][0]))
+            bm.faces.new((bot[i][0], bot[i + 1][0], bot[i + 1][1], bot[i][1]))
+            bm.faces.new((top[i][0], top[i + 1][0], bot[i + 1][0], bot[i][0]))
+            bm.faces.new((top[i][1], bot[i][1], bot[i + 1][1], top[i + 1][1]))
+        bm.faces.new((top[0][0], bot[0][0], bot[0][1], top[0][1]))
+        bm.faces.new((top[-1][0], top[-1][1], bot[-1][1], bot[-1][0]))
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+        return self._add(bm, color, bones, **kw)
+
+    def sheet(self, pts, color, bones, thick=0.12, **kw):
+        """thin solid panel through a loop of 3D points (fan from their average): wing membranes, fins"""
+        bm = bmesh.new()
+        ctr = sum(pts, Vector()) / len(pts)
+        n = Vector()
+        for i in range(len(pts)):
+            n += (pts[i] - ctr).cross(pts[(i + 1) % len(pts)] - ctr)
+        n = n.normalized() * thick / 2
+        top = [bm.verts.new(p + n) for p in pts]; bot = [bm.verts.new(p - n) for p in pts]
+        ct, cb = bm.verts.new(ctr + n), bm.verts.new(ctr - n)
+        m = len(pts)
+        for i in range(m):
+            j = (i + 1) % m
+            bm.faces.new((ct, top[i], top[j]))
+            bm.faces.new((cb, bot[j], bot[i]))
+            bm.faces.new((top[i], bot[i], bot[j], top[j]))
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+        return self._add(bm, color, bones, **kw)
+
+    def torus(self, center, R, r, color, bones, rot=None, seg=(24, 8), **kw):
+        bm = bmesh.new()
+        rings = []
+        for i in range(seg[0]):
+            a = i / seg[0] * math.tau
+            ring = []
+            for k in range(seg[1]):
+                b = k / seg[1] * math.tau
+                x = (R + r * math.cos(b)) * math.cos(a)
+                z = (R + r * math.cos(b)) * math.sin(a)
+                y = r * math.sin(b)
+                ring.append(bm.verts.new(P(x, y, z)))
+            rings.append(ring)
+        for i in range(seg[0]):
+            for k in range(seg[1]):
+                a, b = rings[i][k], rings[i][(k + 1) % seg[1]]
+                c, d = rings[(i + 1) % seg[0]][(k + 1) % seg[1]], rings[(i + 1) % seg[0]][k]
+                bm.faces.new((a, d, c, b))
+        m = Matrix.Translation(center) @ ((rot.to_4x4()) if rot else Matrix.Identity(4))
+        bmesh.ops.transform(bm, matrix=m, verts=bm.verts)
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+        return self._add(bm, color, bones, **kw)
+
+    def box(self, center, half, color, bones, rot=None, **kw):
+        bm = bmesh.new()
+        bmesh.ops.create_cube(bm, size=2.0)
+        m = Matrix.Diagonal((half[0], half[2], half[1], 1.0))
+        if rot is not None:
+            m = rot.to_4x4() @ m
+        bmesh.ops.transform(bm, matrix=Matrix.Translation(center) @ m, verts=bm.verts)
+        return self._add(bm, color, bones, **kw)
+
+    # cartoon eye: white, coloured iris, black pupil, two highlights. `facing` = outward direction
+    def snap(self, point, direction, max_dist=4.0):
+        """move a point onto the outer surface of the shapes built so far, looking back along -direction"""
+        from mathutils.bvhtree import BVHTree
+        d = direction.normalized()
+        start = point + d * max_dist
+        best = None
+        for sh in self.shapes:
+            if sh["glow"]:
+                continue
+            tree = BVHTree.FromBMesh(sh["bm"])
+            hit = tree.ray_cast(start, -d, max_dist * 2)
+            if hit[0] is not None:
+                dist = (hit[0] - start).length
+                if best is None or dist < best[1]:
+                    best = (hit[0], dist, hit[1])
+        return (best[0], best[2]) if best else (point, d)
+
+    def eye(self, center, size, facing, bones, iris=C(60, 140, 230), lid=None, angry=0.0, style="black", snap=True):
+        if snap:
+            center, nrm = self.snap(center, facing)
+            facing = (facing.normalized() * 0.5 + nrm.normalized() * 0.5)
+        f = facing.normalized()
+        up = Vector((0, 0, 1))
+        side = f.cross(up).normalized()
+        upv = side.cross(f).normalized()
+        rot = Matrix((side, f, upv)).transposed()  # columns: x=side, y=facing, z=up (blender)
+        def ell(off, rad, col):
+            bm = bmesh.new()
+            bmesh.ops.create_uvsphere(bm, u_segments=16, v_segments=10, radius=1.0)
+            m = Matrix.Translation(center + side * off[0] + f * off[1] + upv * off[2]) @ rot.to_4x4() @ Matrix.Diagonal((rad[0], rad[1], rad[2], 1))
+            bmesh.ops.transform(bm, matrix=m, verts=bm.verts)
+            self._add(bm, col, bones, stud=False, smooth=True)
+        s = size
+        if style == "black":
+            # flat black eye: a thin oval pushed into the surface so only a flush, flat face shows
+            ell((0, -s * 0.12, 0), (s * 0.62, s * 0.2, s * 0.85), C(12, 12, 16))
+        else:
+            ell((0, 0, 0), (s * 0.85, s * 0.45, s), C(255, 255, 255))
+            ell((0, s * 0.18, -s * 0.08), (s * 0.6, s * 0.35, s * 0.68), iris)
+            ell((0, s * 0.3, -s * 0.1), (s * 0.36, s * 0.28, s * 0.42), C(15, 15, 25))
+            ell((-s * 0.22, s * 0.48, s * 0.25), (s * 0.17, s * 0.1, s * 0.17), C(255, 255, 255))
+            ell((s * 0.2, s * 0.44, -s * 0.32), (s * 0.08, s * 0.06, s * 0.08), C(255, 255, 255))
+        if lid:
+            bm = bmesh.new()
+            bmesh.ops.create_uvsphere(bm, u_segments=16, v_segments=10, radius=1.0)
+            m = Matrix.Translation(center + upv * s * 0.55 + f * s * 0.05) @ rot.to_4x4() @ Matrix.Rotation(angry, 4, "Y") @ Matrix.Diagonal((s * 1.0, s * 0.5, s * 0.35, 1))
+            bmesh.ops.transform(bm, matrix=m, verts=bm.verts)
+            self._add(bm, lid, bones)
+
+    # ---------------------------------------------------------------- build
+    def _weights(self, verts, bones):
+        """weights for a shape: single bone -> 1.0; several -> blend by distance to bone segments"""
+        if len(bones) == 1:
+            return [{bones[0]: 1.0} for _ in verts]
+        segs = []
+        for b in bones:
+            for n, h, t, p in self.bones:
+                if n == b:
+                    segs.append((b, h, t))
+        out = []
+        for v in verts:
+            ds = []
+            for b, h, t in segs:
+                ab = t - h
+                tt = max(0, min(1, (v - h).dot(ab) / ab.length_squared))
+                ds.append((b, (v - (h + ab * tt)).length + 1e-4))
+            ws = [(b, 1 / d ** 4) for b, d in ds]
+            tot = sum(w for _, w in ws)
+            ws = sorted(((b, w / tot) for b, w in ws), key=lambda x: -x[1])[:2]
+            tot = sum(w for _, w in ws)
+            out.append({b: w / tot for b, w in ws})
+        return out
+
+    def build(self, outdir):
+        os.makedirs(outdir, exist_ok=True)
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        scn = bpy.context.scene
+        # armature
+        arm_data = bpy.data.armatures.new(self.name + "_Rig")
+        arm = bpy.data.objects.new(self.name, arm_data)
+        scn.collection.objects.link(arm)
+        bpy.context.view_layer.objects.active = arm
+        bpy.ops.object.mode_set(mode="EDIT")
+        for n, h, t, p in self.bones:
+            eb = arm_data.edit_bones.new(self.bn(n))
+            eb.head, eb.tail = h, t
+            eb.roll = 0
+        for n, h, t, p in self.bones:
+            if p:
+                eb = arm_data.edit_bones[self.bn(n)]
+                eb.parent = arm_data.edit_bones[self.bn(p)]
+                eb.use_connect = False
+        bpy.ops.object.mode_set(mode="OBJECT")
+        self.arm = arm
+        # palette
+        cols = []
+        for s in self.shapes:
+            if s["color"] not in cols:
+                cols.append(s["color"])
+        self.palette = cols
+        self.paints = []
+        # meshes: one "Body" mesh (studded, textured) + one mesh per glow colour
+        groups = {"Body": [s for s in self.shapes if not s["glow"]]}
+        for s in self.shapes:
+            if s["glow"]:
+                key = "Glow_%02x%02x%02x" % tuple(int(c * 255) for c in s["color"])
+                groups.setdefault(key, []).append(s)
+        self.mesh_objs = {}
+        for gname, shapes in groups.items():
+            bm = bmesh.new()
+            col_layer = bm.faces.layers.int.new("col")
+            flag_layer = bm.faces.layers.int.new("flag")
+            paint_layer = bm.faces.layers.int.new("paint")
+            deform = bm.verts.layers.deform.verify()
+            bone_index = {n: i for i, (n, *_r) in enumerate(self.bones)}
+            for s in shapes:
+                src = s["bm"]
+                vmap = {}
+                ws = self._weights([v.co for v in src.verts], s["bones"])
+                for v, w in zip(src.verts, ws):
+                    nv = bm.verts.new(v.co)
+                    for b, wt in w.items():
+                        nv[deform][bone_index[b]] = wt
+                    vmap[v] = nv
+                ci = cols.index(s["color"])
+                pidx = 0
+                if s.get("paint"):
+                    self.paints.append(s["paint"])
+                    pidx = len(self.paints)
+                for f in src.faces:
+                    try:
+                        nf = bm.faces.new([vmap[v] for v in f.verts])
+                    except ValueError:
+                        continue
+                    nf[col_layer] = ci
+                    nf[paint_layer] = pidx
+                    nf[flag_layer] = (1 if s["stud"] else 0) | (2 if s["smooth"] else 0)
+                    nf.smooth = s["smooth"]
+            uname = self.name + "_" + gname          # unique per creature (batch FBX files hold several)
+            me = bpy.data.meshes.new(uname)
+            bm.to_mesh(me)
+            bm.free()
+            ob = bpy.data.objects.new(uname, me)
+            scn.collection.objects.link(ob)
+            for n, *_r in self.bones:
+                ob.vertex_groups.new(name=self.bn(n))
+            ob.parent = arm
+            mod = ob.modifiers.new("Armature", "ARMATURE")
+            mod.object = arm
+            self.mesh_objs[gname] = ob
+        self._texture(outdir)
+        return self
+
+    # ---------------------------------------------------------------- texture
+    def _texture(self, outdir, size=2048):
+        body = self.mesh_objs["Body"]
+        bpy.ops.object.select_all(action="DESELECT")
+        body.select_set(True)
+        bpy.context.view_layer.objects.active = body
+        bpy.ops.object.mode_set(mode="EDIT")
+        bpy.ops.mesh.select_all(action="SELECT")
+        # lightmap pack: every face tiled tightly (smart project used only ~10% of the texture on faceted fur)
+        bpy.ops.uv.lightmap_pack(PREF_CONTEXT="ALL_FACES", PREF_PACK_IN_ONE=True, PREF_BOX_DIV=48, PREF_MARGIN_DIV=0.15)
+        bpy.ops.object.mode_set(mode="OBJECT")
+        me = body.data
+        uv = me.uv_layers.active.data
+        cols = me.attributes["col"].data
+        flags = me.attributes["flag"].data
+        img = Image.new("RGB", (size, size), (0, 0, 0))
+        mask = Image.new("L", (size, size), 0)       # 255 = has stud pattern
+        filled = Image.new("L", (size, size), 0)
+        dr, dm, df = ImageDraw.Draw(img), ImageDraw.Draw(mask), ImageDraw.Draw(filled)
+        rng = random.Random(7)
+        world_area, uv_area = 0.0, 0.0
+        for poly in me.polygons:
+            pts = [uv[li].uv for li in poly.loop_indices]
+            a = 0.0
+            for i in range(len(pts)):
+                x1, y1 = pts[i]; x2, y2 = pts[(i + 1) % len(pts)]
+                a += x1 * y2 - x2 * y1
+            uv_area += abs(a) / 2
+            world_area += poly.area
+            base = self.palette[cols[poly.index].value]
+            nz = poly.normal.z
+            shade = 1.0 + 0.10 * nz - (0.10 if nz < -0.3 else 0) + rng.uniform(-0.025, 0.025)
+            if flags[poly.index].value & 2:
+                shade = 1.0
+            c = tuple(int(max(0, min(255, ch * 255 * shade))) for ch in base)
+            xy = [(p[0] * size, (1 - p[1]) * size) for p in pts]
+            dr.polygon(xy, fill=c, outline=c)
+            df.polygon(xy, fill=255, outline=255)
+            if flags[poly.index].value & 1:
+                dm.polygon(xy, fill=255, outline=255)
+        # bleed colours into empty pixels so UV seams don't show black lines
+        arr = np.array(img).astype(np.int32)
+        fm = np.array(filled) > 0
+        for _ in range(24):
+            grown = arr.copy(); gm = fm.copy()
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                sh = np.roll(np.roll(arr, dx, 1), dy, 0)
+                shm = np.roll(np.roll(fm, dx, 1), dy, 0)
+                take = shm & ~gm
+                grown[take] = sh[take]; gm |= take
+            arr, fm = grown, gm
+        # per-pixel painted patterns (stripes, spots...): every texel finds its 3D spot on the body
+        if self.paints:
+            pa = me.attributes["paint"].data
+            co = np.array([(-v.co.x, v.co.z, v.co.y) for v in me.vertices])   # game coords
+            for poly in me.polygons:
+                pi = pa[poly.index].value
+                if pi == 0:
+                    continue
+                col, maskfn = self.paints[pi - 1]
+                lis = list(poly.loop_indices)
+                for tri in range(1, len(lis) - 1):
+                    ids = (lis[0], lis[tri], lis[tri + 1])
+                    uvp = np.array([(uv[i].uv[0] * size, (1 - uv[i].uv[1]) * size) for i in ids])
+                    p3 = co[[me.loops[i].vertex_index for i in ids]]
+                    x0, y0 = np.floor(uvp.min(0)).astype(int) - 1
+                    x1, y1 = np.ceil(uvp.max(0)).astype(int) + 1
+                    x0, y0 = max(x0, 0), max(y0, 0); x1, y1 = min(x1, size - 1), min(y1, size - 1)
+                    if x1 <= x0 or y1 <= y0:
+                        continue
+                    gy, gx = np.mgrid[y0:y1 + 1, x0:x1 + 1]
+                    (ax, ay), (bx, by), (cx, cy) = uvp
+                    den = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+                    if abs(den) < 1e-9:
+                        continue
+                    l1 = ((by - cy) * (gx + 0.5 - cx) + (cx - bx) * (gy + 0.5 - cy)) / den
+                    l2 = ((cy - ay) * (gx + 0.5 - cx) + (ax - cx) * (gy + 0.5 - cy)) / den
+                    l3 = 1 - l1 - l2
+                    inside = (l1 >= -0.02) & (l2 >= -0.02) & (l3 >= -0.02)
+                    if not inside.any():
+                        continue
+                    X = l1 * p3[0, 0] + l2 * p3[1, 0] + l3 * p3[2, 0]
+                    Y = l1 * p3[0, 1] + l2 * p3[1, 1] + l3 * p3[2, 1]
+                    Z = l1 * p3[0, 2] + l2 * p3[1, 2] + l3 * p3[2, 2]
+                    m2 = inside & maskfn(X, Y, Z)
+                    if m2.any():
+                        shade = arr[gy[m2], gx[m2]].astype(np.float32) / (np.array(self.palette[cols[poly.index].value]) * 255 + 1e-3)
+                        shade = np.clip(shade.mean(-1, keepdims=True), 0.7, 1.3)
+                        arr[gy[m2], gx[m2]] = np.clip(np.array(col) * 255 * shade, 0, 255).astype(np.int32)
+        # stud pattern evaluated in 3D (world units) per texel, so every stud is the same size whatever the UV
+        # layout does. Each face projects onto the two axes most parallel to it.
+        ppu = math.sqrt(uv_area * size * size / max(world_area, 1e-6))
+        print("STUDTILE", round(self.stud * ppu, 1), "px", "cover", round(uv_area, 3))
+        studs = np.ones((size, size), np.float32)
+        co = np.array([(-v.co.x, v.co.z, v.co.y) for v in me.vertices])   # game coords
+        m = 0.16
+        k_ = getattr(self, "stud_k", 1.0)
+
+        def pattern(Ua, Va):
+            u = Ua - np.floor(Ua); v = Va - np.floor(Va)
+            inner = (u > m) & (u < 1 - m) & (v > m) & (v < 1 - m)
+            cu, cv = (u - 0.5) / (0.5 - m), (v - 0.5) / (0.5 - m)
+            mx = np.maximum(np.abs(cu), np.abs(cv))
+            edge = inner & (mx > 0.72)
+            out = np.ones_like(u)
+            out[inner] = 1.03
+            out[edge & (((cu < 0) & (np.abs(cu) >= np.abs(cv))) | ((cv > 0) & (np.abs(cv) >= np.abs(cu))))] = 1.14
+            out[edge & (((cu > 0) & (np.abs(cu) >= np.abs(cv))) | ((cv < 0) & (np.abs(cv) >= np.abs(cu))))] = 0.8
+            out[(u < 0.05) | (v < 0.05)] = 0.94
+            return 1 + (out - 1) * k_
+        for poly in me.polygons:
+            if not (flags[poly.index].value & 1):
+                continue
+            nb = poly.normal
+            ng = (abs(nb.x), abs(nb.z), abs(nb.y))          # game |x|,|y|,|z|
+            ax = (2, 1) if ng[0] >= max(ng[1], ng[2]) else ((0, 2) if ng[1] >= ng[2] else (0, 1))
+            lis = list(poly.loop_indices)
+            for tri in range(1, len(lis) - 1):
+                ids = (lis[0], lis[tri], lis[tri + 1])
+                uvp = np.array([(uv[i].uv[0] * size, (1 - uv[i].uv[1]) * size) for i in ids])
+                p3 = co[[me.loops[i].vertex_index for i in ids]]
+                x0, y0 = np.floor(uvp.min(0)).astype(int) - 1
+                x1, y1 = np.ceil(uvp.max(0)).astype(int) + 1
+                x0, y0 = max(x0, 0), max(y0, 0); x1, y1 = min(x1, size - 1), min(y1, size - 1)
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                gy, gx = np.mgrid[y0:y1 + 1, x0:x1 + 1]
+                (ax_, ay_), (bx_, by_), (cx_, cy_) = uvp
+                den = (by_ - cy_) * (ax_ - cx_) + (cx_ - bx_) * (ay_ - cy_)
+                if abs(den) < 1e-9:
+                    continue
+                l1 = ((by_ - cy_) * (gx + 0.5 - cx_) + (cx_ - bx_) * (gy + 0.5 - cy_)) / den
+                l2 = ((cy_ - ay_) * (gx + 0.5 - cx_) + (ax_ - cx_) * (gy + 0.5 - cy_)) / den
+                l3 = 1 - l1 - l2
+                inside = (l1 >= -0.08) & (l2 >= -0.08) & (l3 >= -0.08)
+                if not inside.any():
+                    continue
+                A = l1 * p3[0, ax[0]] + l2 * p3[1, ax[0]] + l3 * p3[2, ax[0]]
+                Bv = l1 * p3[0, ax[1]] + l2 * p3[1, ax[1]] + l3 * p3[2, ax[1]]
+                pat = pattern(A[inside] / self.stud, Bv[inside] / self.stud)
+                studs[gy[inside], gx[inside]] = pat
+        f = studs[..., None]
+        out = np.clip(arr * f, 0, 255).astype(np.uint8)
+        self.tex_path = os.path.join(outdir, self.name + "_Tex.png")
+        Image.fromarray(out).save(self.tex_path)
+        # material
+        mat = bpy.data.materials.new(self.name + "_Mat")
+        mat.use_nodes = True
+        nt = mat.node_tree
+        bsdf = nt.nodes["Principled BSDF"]
+        bsdf.inputs["Roughness"].default_value = 0.6
+        tn = nt.nodes.new("ShaderNodeTexImage")
+        tn.image = bpy.data.images.load(self.tex_path)
+        nt.links.new(tn.outputs["Color"], bsdf.inputs["Base Color"])
+        body.data.materials.append(mat)
+        for gname, ob in self.mesh_objs.items():
+            if gname.startswith("Glow_"):
+                gm = bpy.data.materials.new(gname + "_Mat")
+                gm.use_nodes = True
+                b = gm.node_tree.nodes["Principled BSDF"]
+                hexs = gname[5:]
+                rgbv = tuple(int(hexs[i:i + 2], 16) / 255 for i in (0, 2, 4))
+                b.inputs["Base Color"].default_value = rgbv + (1,)
+                b.inputs["Emission Color"].default_value = rgbv + (1,)
+                b.inputs["Emission Strength"].default_value = 1.4
+                ob.data.materials.append(gm)
+
+    # ---------------------------------------------------------------- animation
+    def animate(self, clips):
+        """clips = {"Idle": (frames, seconds, fn), ...} where fn(t01) returns
+        {bone: (rx, ry, rz) degrees in game axes (local, applied around the bone head) or (rot, (dx,dy,dz))}"""
+        arm = self.arm
+        bpy.context.view_layer.objects.active = arm
+        bpy.ops.object.mode_set(mode="POSE")
+        self.anim_data = {}
+        rest = {b.name: b.matrix_local.copy() for b in arm.data.bones}
+        rest = {n: rest[self.bn(n)] for n, *_r in self.bones}
+        for clip, (frames, seconds, fn) in clips.items():
+            data = []
+            for fi in range(frames):
+                t = fi / frames
+                pose = fn(t)
+                # reset
+                for pb in arm.pose.bones:
+                    pb.matrix_basis = Matrix.Identity(4)
+                bpy.context.view_layer.update()
+                # apply top-down: rotation around the bone head in WORLD(armature) axes, given in game axes
+                order = [n for n, *_r in self.bones]
+                for name in order:
+                    if name not in pose:
+                        continue
+                    val = pose[name]
+                    rot, off = (val, (0, 0, 0)) if len(val) == 3 and not isinstance(val[0], tuple) else val
+                    pb = arm.pose.bones[self.bn(name)]
+                    R = euler(*rot).to_4x4()   # game-axis rotation -> blender
+                    cur = pb.matrix.copy()                          # armature-space current matrix
+                    head = cur.to_translation()
+                    M = Matrix.Translation(head + P(*off)) @ R @ Matrix.Translation(-head) @ cur
+                    pb.matrix = M
+                    bpy.context.view_layer.update()
+                frame = {}
+                for name in order:
+                    pb = arm.pose.bones[self.bn(name)]
+                    delta = pb.matrix @ rest[name].inverted()       # armature-space delta (rest -> posed)
+                    # convert to game axes: Dg = G^-1 * delta * G
+                    Dg = G.to_4x4() @ delta @ G.to_4x4()
+                    q = Dg.to_quaternion()
+                    tr = Dg.to_translation()
+                    frame[name] = [round(q.w, 4), round(q.x, 4), round(q.y, 4), round(q.z, 4), round(tr.x, 3), round(tr.y, 3), round(tr.z, 3)]
+                data.append(frame)
+            self.anim_data[clip] = {"fps": round(frames / seconds, 3), "frames": data}
+        for pb in arm.pose.bones:
+            pb.matrix_basis = Matrix.Identity(4)
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    def pose_at(self, clip, fi):
+        """apply a recorded frame to the blender rig (for preview renders)"""
+        arm = self.arm
+        bpy.context.view_layer.objects.active = arm
+        bpy.ops.object.mode_set(mode="POSE")
+        rest = {b.name: b.matrix_local.copy() for b in arm.data.bones}
+        rest = {n: rest[self.bn(n)] for n, *_r in self.bones}
+        for name, *_r in self.bones:
+            w, x, y, z, tx, ty, tz = self.anim_data[clip]["frames"][fi][name]
+            Dg = Matrix.Translation((tx, ty, tz)) @ Quaternion((w, x, y, z)).to_matrix().to_4x4()
+            delta = G.to_4x4() @ Dg @ G.to_4x4()
+            arm.pose.bones[self.bn(name)].matrix = delta @ rest[name]
+            bpy.context.view_layer.update()
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    # ---------------------------------------------------------------- output
+    def render(self, path, angle=30, elev=15, res=800, samples=20, dist=1.35):
+        scn = bpy.context.scene
+        scn.render.engine = "CYCLES"; scn.cycles.device = "CPU"; scn.cycles.samples = samples
+        scn.cycles.use_denoising = True
+        scn.render.resolution_x = scn.render.resolution_y = res
+        if not scn.world:
+            scn.world = bpy.data.worlds.new("W")
+        scn.world.use_nodes = True
+        bg = scn.world.node_tree.nodes["Background"]
+        bg.inputs["Color"].default_value = (0.6, 0.78, 0.95, 1); bg.inputs["Strength"].default_value = 0.9
+        mn = Vector((1e9,) * 3); mx = Vector((-1e9,) * 3)
+        dg = bpy.context.evaluated_depsgraph_get()
+        for ob in self.mesh_objs.values():
+            ev = ob.evaluated_get(dg)
+            for v in ev.to_mesh().vertices:
+                w = ob.matrix_world @ v.co
+                mn = Vector(map(min, mn, w)); mx = Vector(map(max, mx, w))
+            ev.to_mesh_clear()
+        ctr = (mn + mx) / 2; size = (mx - mn).length
+        if "Sun" not in bpy.data.objects:
+            sun = bpy.data.lights.new("Sun", "SUN"); sun.energy = 2.6; sun.angle = math.radians(10)
+            so = bpy.data.objects.new("Sun", sun); scn.collection.objects.link(so)
+            so.rotation_euler = (math.radians(45), math.radians(15), math.radians(-30))
+            bpy.ops.mesh.primitive_plane_add(size=300, location=(ctr.x, ctr.y, 0))
+            g = bpy.context.active_object; g.name = "Ground"
+            gmat = bpy.data.materials.new("Gr"); gmat.use_nodes = True
+            gmat.node_tree.nodes["Principled BSDF"].inputs["Base Color"].default_value = (0.3, 0.65, 0.22, 1)
+            g.data.materials.append(gmat)
+        cam = bpy.data.objects.get("Cam")
+        if not cam:
+            cd = bpy.data.cameras.new("Cam"); cd.lens = 50
+            cam = bpy.data.objects.new("Cam", cd); scn.collection.objects.link(cam)
+        scn.camera = cam
+        a, e = math.radians(angle), math.radians(elev)
+        d = size * dist
+        cam.location = ctr + Vector((math.sin(a) * math.cos(e) * d, -math.cos(a) * math.cos(e) * d, math.sin(e) * d))
+        cam.rotation_euler = (ctr - cam.location).to_track_quat("-Z", "Y").to_euler()
+        scn.render.filepath = path
+        bpy.ops.render.render(write_still=True)
+
+    def export(self, outdir, scale_info=True):
+        fbx = os.path.join(outdir, self.name + ".fbx")
+        bpy.ops.object.select_all(action="DESELECT")
+        self.arm.select_set(True)
+        for ob in self.mesh_objs.values():
+            ob.select_set(True)
+        bpy.ops.export_scene.fbx(filepath=fbx, use_selection=True, object_types={"ARMATURE", "MESH"},
+                                 path_mode="COPY", embed_textures=True, axis_forward="-Z", axis_up="Y",
+                                 add_leaf_bones=False, bake_anim=False, use_armature_deform_only=False,
+                                 mesh_smooth_type="FACE", apply_scale_options="FBX_SCALE_ALL")
+        info = {"name": self.name, "height": self.height,
+                "bones": [{"name": n, "parent": p, "head": [round(c, 3) for c in (-h.x, h.z, h.y)]} for n, h, t, p in self.bones],
+                "glow": {self.name + "_" + g: g[5:] for g in self.mesh_objs if g.startswith("Glow_")},
+                "body": self.name + "_Body",
+                "anims": getattr(self, "anim_data", {}), "extra": self.extra}
+        with open(os.path.join(outdir, self.name + "_data.json"), "w") as f:
+            json.dump(info, f, separators=(",", ":"))
+        return fbx
+
+##### FILE: creature_pipeline/kit.py #####
+"""Reusable body plans + animations for the creatures (game coords via P: y up, z back, front -z)."""
+import math
+from sculpt import *
+
+sin, cos, tau = math.sin, math.cos, math.tau
+
+
+# ============================================================== QUADRUPED
+def quad(c, col, belly=None, L=1.0, H=1.0, W=1.0, leg=1.0, paw=None, chest_y=None, tail=3, neck=True, paint=None, chunk=1.0):
+    """standard 4-legged body. L/H/W scale length/height/width. chunk > 1 = thicker legs + fuller body
+    (owner asked for chunkier creatures from batch 7 on). Returns key points dict."""
+    sh_y = 4.3 * H                     # shoulder height
+    hip_z, chest_z = 1.8 * L, -1.9 * L
+    x = 1.05 * W * (1 + 0.22 * (chunk - 1))
+    c.bone("Root", P(0, 0, 0), P(0, 1, 0))
+    c.bone("Hips", P(0, sh_y, hip_z), P(0, sh_y + 0.1, 0), "Root")
+    c.bone("Chest", P(0, sh_y + 0.1, 0), P(0, sh_y + 0.5 * H, chest_z), "Hips")
+    nb = P(0, sh_y + 0.7 * H, chest_z)
+    hb = P(0, sh_y + 1.7 * H, chest_z - 1.0 * L)
+    c.bone("Neck", nb, hb, "Chest")
+    c.bone("Head", hb, hb + P(0, 0.3, -1.6 * L), "Neck")
+    for s, S in ((-1, "L"), (1, "R")):
+        c.bone("Arm" + S, P(s * x, sh_y, chest_z + 0.1), P(s * x, sh_y * 0.5, chest_z - 0.1), "Chest")
+        c.bone("Fore" + S, P(s * x, sh_y * 0.5, chest_z - 0.1), P(s * x, 0.45, chest_z - 0.05), "Arm" + S)
+        c.bone("Thigh" + S, P(s * x * 0.95, sh_y - 0.2, hip_z - 0.1), P(s * x, sh_y * 0.55, hip_z - 0.6), "Hips")
+        c.bone("Shin" + S, P(s * x, sh_y * 0.55, hip_z - 0.6), P(s * x, 0.45, hip_z + 0.1), "Thigh" + S)
+    if tail:
+        t0 = P(0, sh_y + 0.2, hip_z + 1.1 * L)
+        prev = "Hips"
+        for i in range(tail):
+            t1 = t0 + P(0, 0.35 * H, 1.15 * L)
+            c.bone("Tail%d" % (i + 1), t0, t1, prev)
+            prev, t0 = "Tail%d" % (i + 1), t1
+    belly = belly or col
+    r = 1.45 * min(H, W) ** 0.5 * (1 + 0.3 * (chunk - 1))
+    c.tube([P(0, sh_y - 0.05, hip_z + 0.95 * L), P(0, sh_y, hip_z + 0.3 * L), P(0, sh_y + 0.1, 0.9 * L * 0.5), P(0, sh_y + 0.2, -0.5 * L), P(0, sh_y + 0.35 * H, chest_z + 0.4 * L), P(0, sh_y + 0.4 * H, chest_z - 0.35 * L)],
+           [0.9 * r / 1.45, r * 0.95, r, r * 1.03, r * 1.1, r * 0.92], col, ["Hips", "Chest"], seg=18, flat=(W ** 0.5 * 0.92, 1.0), sub=5, paint=paint)
+    c.ellipsoid(P(0, sh_y - r * 0.6, -0.2 * L), (r * 0.72 * W, r * 0.38, 2.1 * L), belly, ["Hips", "Chest"])
+    if neck:
+        c.tube([P(0, sh_y + 0.3 * H, chest_z + 0.1), P(0, sh_y + 1.0 * H, chest_z - 0.5 * L), hb + P(0, -0.1, 0.1)], [r * 0.8, r * 0.72, r * 0.66], col, ["Chest", "Neck"], seg=14, paint=paint)
+    pawc = paw or belly
+    if chunk >= 1.3:
+        # chunky legs: one smooth rounded column per leg (no flare, no seams) + round paws
+        for s, S in ((-1, "L"), (1, "R")):
+            lr = 0.55 * leg * W ** 0.5 * chunk
+            c.ellipsoid(P(s * x * 0.97, sh_y * 0.86, chest_z + 0.05), (lr * 1.18, sh_y * 0.28, lr * 1.3), col, "Arm" + S, seg=(20, 12), paint=paint)   # shoulder
+            c.tube([P(s * x, sh_y * 0.86, chest_z + 0.05), P(s * x * 1.02, sh_y * 0.7, chest_z - 0.02), P(s * x * 1.03, sh_y * 0.5, chest_z - 0.1)],
+                   [lr * 1.05, lr * 1.0, lr * 0.93], col, ["Arm" + S], seg=14, paint=paint)
+            c.tube([P(s * x * 1.03, sh_y * 0.56, chest_z - 0.1), P(s * x * 1.04, sh_y * 0.3, chest_z - 0.08), P(s * x * 1.05, 0.55, chest_z - 0.05)],
+                   [lr * 0.93, lr * 0.88, lr * 0.9], col, ["Fore" + S], seg=14, paint=paint)
+            c.ellipsoid(P(s * x * 1.05, 0.45, chest_z - 0.22), (lr * 1.02, 0.45, lr * 1.15), pawc, "Fore" + S, seg=(18, 10))
+            c.ellipsoid(P(s * x * 0.97, sh_y * 0.78, hip_z - 0.15), (lr * 1.25, sh_y * 0.32, lr * 1.45), col, "Thigh" + S, seg=(20, 12), paint=paint)
+            c.tube([P(s * x, sh_y * 0.7, hip_z - 0.2), P(s * x * 1.02, sh_y * 0.48, hip_z - 0.25), P(s * x * 1.04, sh_y * 0.28, hip_z - 0.05), P(s * x * 1.05, 0.55, hip_z + 0.1)],
+                   [lr * 1.0, lr * 0.93, lr * 0.88, lr * 0.9], col, ["Shin" + S], seg=14, paint=paint)
+            c.ellipsoid(P(s * x * 1.05, 0.45, hip_z - 0.12), (lr * 1.0, 0.45, lr * 1.12), pawc, "Shin" + S, seg=(18, 10))
+            for t in (-1, 0, 1):   # toe beans
+                for zz, bone in ((chest_z - 0.22 - lr * 1.05, "Fore" + S), (hip_z - 0.12 - lr * 1.02, "Shin" + S)):
+                    c.ellipsoid(P(s * x * 1.05 + t * lr * 0.42, 0.32, zz + 0.12), (lr * 0.22, 0.18, lr * 0.16), pawc, bone, seg=(8, 6))
+        return dict(sh_y=sh_y, hip_z=hip_z, chest_z=chest_z, x=x, head=hb, r=r)
+    for s, S in ((-1, "L"), (1, "R")):
+        lr = 0.55 * leg * W ** 0.5 * chunk
+        tp = 1 + 0.5 * (chunk - 1)          # chunky legs taper less (thick all the way down)
+        top = 1.45 if chunk <= 1.0 else 1.18          # mild chunk: thicker legs without the flared tops
+        c.tube([P(s * x, sh_y + 0.2, chest_z + 0.15), P(s * x * 1.03, sh_y * 0.75, chest_z - 0.05), P(s * x * 1.03, sh_y * 0.5, chest_z - 0.12)], [lr * top, lr * 1.08, lr * 0.9], col, ["Arm" + S], seg=10, paint=paint)
+        c.tube([P(s * x * 1.03, sh_y * 0.53, chest_z - 0.12), P(s * x * 1.05, sh_y * 0.27, chest_z - 0.08), P(s * x * 1.05, 0.5, chest_z - 0.05)], [lr * 0.9, lr * 0.8 * tp, lr * 0.82 * tp], col, ["Fore" + S], seg=10, paint=paint)
+        c.ellipsoid(P(s * x * 1.05, 0.33, chest_z - 0.3), (lr * 1.0 * tp, 0.33 * tp, lr * 1.25 * tp), pawc, "Fore" + S)
+        c.ellipsoid(P(s * x * 0.95, sh_y * 0.8, hip_z - 0.15), (lr * 1.5, sh_y * 0.3, lr * 1.85), col, "Thigh" + S, seg=(20, 12), paint=paint)
+        c.tube([P(s * x, sh_y * 0.78, hip_z - 0.25), P(s * x * 1.02, sh_y * 0.55, hip_z - 0.55), P(s * x * 1.04, sh_y * 0.3, hip_z - 0.1), P(s * x * 1.05, 0.5, hip_z + 0.15)], [lr * 1.1, lr * 0.9 * tp, lr * 0.75 * tp, lr * 0.8 * tp], col, ["Shin" + S], seg=10, paint=paint)
+        c.ellipsoid(P(s * x * 1.05, 0.33, hip_z - 0.1), (lr * 0.95 * tp, 0.32 * tp, lr * 1.2 * tp), pawc, "Shin" + S)
+    return dict(sh_y=sh_y, hip_z=hip_z, chest_z=chest_z, x=x, head=hb, r=r)
+
+
+def claws(c, x, z, col, bone, n=3, size=0.25):
+    for k in range(n):
+        o = (k - (n - 1) / 2) * size * 0.9
+        c.spike(P(x + o, 0.22, z - 0.05), P(x + o * 1.1, 0.06, z - size * 1.3), size * 0.3, col, bone, seg=5, n=3)
+
+
+def quad_anims(c, wings=False, tail=3, stride=24, bob=0.1, head_amp=1.0, extra=None):
+    def walk(t):
+        p = tau * t
+        out = {
+            "Root": ((0, 0, 0), (0, bob * abs(sin(2 * p)), 0)),
+            "Chest": (1.5 * sin(2 * p), 2 * sin(p), 0),
+            "Neck": (-3 * sin(2 * p) * head_amp, -2 * sin(p), 0),
+            "Head": (2 * sin(2 * p + 0.5) * head_amp, 0, 0),
+            "ArmL": (stride * sin(p), 0, 0), "ArmR": (-stride * sin(p), 0, 0),
+            "ThighL": (-stride * sin(p), 0, 0), "ThighR": (stride * sin(p), 0, 0),
+            "ForeL": (-28 * max(0, -sin(p - 0.6)), 0, 0), "ForeR": (-28 * max(0, sin(p - 0.6)), 0, 0),
+            "ShinL": (24 * max(0, sin(p + 0.4)), 0, 0), "ShinR": (24 * max(0, -sin(p + 0.4)), 0, 0),
+        }
+        for i in range(tail):
+            out["Tail%d" % (i + 1)] = (0, (12 + 2 * i) * sin(p - 0.7 * i), 0)
+        if wings:
+            out.update({"WingL": (0, 0, 8 + 7 * sin(2 * p)), "WingR": (0, 0, -8 - 7 * sin(2 * p)),
+                        "WingTipL": (0, 0, 6 * sin(2 * p - 0.6)), "WingTipR": (0, 0, -6 * sin(2 * p - 0.6))})
+        if extra:
+            out.update(extra(t, True))
+        return out
+
+    def idle(t):
+        p = tau * t
+        out = {
+            "Root": ((0, 0, 0), (0, 0.06 * sin(2 * p), 0)),
+            "Chest": (1.5 * sin(2 * p), 0, 0),
+            "Neck": (2 * sin(p), 14 * sin(p) * head_amp, 0),
+            "Head": (4 * sin(2 * p + 1), 0, 4 * sin(p)),
+        }
+        for i in range(tail):
+            out["Tail%d" % (i + 1)] = (0, (9 + 2 * i) * sin(p - 0.8 * i), 0)
+        if wings:
+            out.update({"WingL": (0, 0, 4 + 10 * sin(p)), "WingR": (0, 0, -4 - 10 * sin(p)),
+                        "WingTipL": (0, 0, 8 * sin(p - 0.8)), "WingTipR": (0, 0, -8 * sin(p - 0.8))})
+        if extra:
+            out.update(extra(t, False))
+        return out
+    c.animate({"Walk": (24, 1.0, walk), "Idle": (40, 4.0, idle)})
+
+
+# ============================================================== WINGS
+def wing_bones(c, root, mid, tip, parent="Chest"):
+    for s, S in ((-1, "L"), (1, "R")):
+        r, m, t = (P(s * root[0], root[1], root[2]), P(s * mid[0], mid[1], mid[2]), P(s * tip[0], tip[1], tip[2]))
+        c.bone("Wing" + S, r, m, parent)
+        c.bone("WingTip" + S, m, t, "Wing" + S)
+
+
+def feather_wings(c, root, mid, tip, col, tipcol, cover=None, n=12, length=(2.4, 2.0), width=1.25, arm_col=None):
+    for s, S in ((-1, "L"), (1, "R")):
+        r, m, t = (P(s * root[0], root[1], root[2]), P(s * mid[0], mid[1], mid[2]), P(s * tip[0], tip[1], tip[2]))
+        c.tube([r, m], [0.38, 0.3], arm_col or col, ["Wing" + S], seg=8)
+        c.tube([m, t], [0.3, 0.16], arm_col or col, ["WingTip" + S], seg=8)
+        for i in range(n):
+            k = (i + 0.5) / n
+            base = r.lerp(m, k * 2) if k < 0.5 else m.lerp(t, (k - 0.5) * 2)
+            bone = "Wing" + S if k < 0.5 else "WingTip" + S
+            ln = length[0] + length[1] * k
+            down = P(s * 0.15, -1.0, 0.75 - 0.3 * k).normalized()
+            arm_dir = (m - r) if k < 0.5 else (t - m)
+            c.leaf(base, down, arm_dir, ln, width, col, bone, thick=0.16 + 0.02 * (i % 2), shape="feather", curl=0.05)
+            c.leaf(base + down * (ln * 0.72) + P(0, 0, 0.02), down, arm_dir, ln * 0.32, width * 0.76, tipcol if i % 2 else tipcol, bone, thick=0.18, shape="feather")
+        for i in range(5):
+            k = (i + 0.5) / 5
+            c.leaf(r.lerp(m, k) + P(0, 0.1, -0.12), P(s * 0.1, -1, 0.4), m - r, 1.4, 1.2, cover or col, "Wing" + S, thick=0.2, shape="feather")
+
+
+def bat_wings(c, root, mid, tip, bone_col, skin_col, edge_col=None, fingers=4, glow_edge=False):
+    """membrane wings: arm + finger bones with skin panels between them"""
+    for s, S in ((-1, "L"), (1, "R")):
+        r, m, t = (P(s * root[0], root[1], root[2]), P(s * mid[0], mid[1], mid[2]), P(s * tip[0], tip[1], tip[2]))
+        c.tube([r, m], [0.34, 0.26], bone_col, ["Wing" + S], seg=8)
+        c.tube([m, t], [0.26, 0.12], bone_col, ["WingTip" + S], seg=8)
+        c.spike(m, m + P(s * 0.2, 0.7, -0.3), 0.18, edge_col or bone_col, "WingTip" + S, seg=5, n=3)   # thumb claw
+        ends = []
+        for f in range(fingers):
+            k = f / max(1, fingers - 1)
+            end = m + (P(s * (1.2 + 2.6 * (1 - k)), -1.0 - 3.2 * k, 0.6 + 2.4 * k))
+            c.tube([m, m.lerp(end, 0.5), end], [0.16, 0.12, 0.06], bone_col, ["WingTip" + S], seg=6)
+            ends.append(end)
+        # membrane: one panel per gap between bones, scalloped trailing edge
+        body = r + P(0, -1.8, 1.8)
+        chain = [t] + ends + [body]
+        for i in range(len(chain) - 1):
+            a1, b1 = chain[i], chain[i + 1]
+            mid_edge = (a1 + b1) / 2 + (m - (a1 + b1) / 2) * 0.22     # scallop pulls in toward the wrist
+            if i == len(chain) - 2:
+                panel = [m, a1, mid_edge, b1, r]
+                bones = "Wing" + S
+            else:
+                panel = [m, a1, mid_edge, b1]
+                bones = "WingTip" + S
+            c.sheet(panel, skin_col, bones, thick=0.1)
+        if edge_col and glow_edge:
+            for e in ends:
+                c.ellipsoid(e, (0.16, 0.16, 0.16), edge_col, "WingTip" + S, glow=True)
+
+
+# ============================================================== BIPED
+def biped(c, col, H=1.0, W=1.0, arm_len=1.0, leg_len=1.0, torso=None):
+    """2-legged body (golems, warlocks, owls). Returns key points."""
+    hip_y = 2.8 * leg_len * H
+    sh_y = hip_y + 3.0 * H
+    x_leg, x_arm = 0.75 * W, 1.9 * W
+    c.bone("Root", P(0, 0, 0), P(0, 1, 0))
+    c.bone("Hips", P(0, hip_y, 0), P(0, hip_y + 1.2 * H, 0), "Root")
+    c.bone("Chest", P(0, hip_y + 1.2 * H, 0), P(0, sh_y, 0), "Hips")
+    c.bone("Neck", P(0, sh_y, 0), P(0, sh_y + 0.6 * H, 0), "Chest")
+    c.bone("Head", P(0, sh_y + 0.6 * H, 0), P(0, sh_y + 2.2 * H, 0), "Neck")
+    for s, S in ((-1, "L"), (1, "R")):
+        c.bone("Thigh" + S, P(s * x_leg, hip_y, 0), P(s * x_leg, hip_y * 0.5, -0.1), "Hips")
+        c.bone("Shin" + S, P(s * x_leg, hip_y * 0.5, -0.1), P(s * x_leg, 0.3, 0), "Thigh" + S)
+        c.bone("Arm" + S, P(s * x_arm, sh_y - 0.2, 0), P(s * x_arm * 1.05, sh_y - 1.8 * arm_len * H, 0), "Chest")
+        c.bone("Fore" + S, P(s * x_arm * 1.05, sh_y - 1.8 * arm_len * H, 0), P(s * x_arm * 1.08, sh_y - 3.4 * arm_len * H, -0.3), "Arm" + S)
+    return dict(hip_y=hip_y, sh_y=sh_y, x_leg=x_leg, x_arm=x_arm)
+
+
+def biped_anims(c, stride=22, arm=20, bob=0.12, extra=None, sway=3):
+    def walk(t):
+        p = tau * t
+        out = {
+            "Root": ((0, 0, sway * sin(p)), (0, bob * abs(sin(p * 2)), 0)),
+            "Chest": (3, 5 * sin(p), 0), "Head": (-2, -4 * sin(p), 0),
+            "ThighL": (-stride * sin(p), 0, 0), "ThighR": (stride * sin(p), 0, 0),
+            "ShinL": (25 * max(0, sin(p + 0.5)), 0, 0), "ShinR": (25 * max(0, -sin(p + 0.5)), 0, 0),
+            "ArmL": (arm * sin(p), 0, 4), "ArmR": (-arm * sin(p), 0, -4),
+            "ForeL": (-10 - 8 * sin(p), 0, 0), "ForeR": (-10 + 8 * sin(p), 0, 0),
+        }
+        if extra:
+            out.update(extra(t, True))
+        return out
+
+    def idle(t):
+        p = tau * t
+        out = {
+            "Root": ((0, 0, 0), (0, 0.05 * sin(2 * p), 0)),
+            "Chest": (2 * sin(2 * p), 4 * sin(p), 0), "Head": (3 * sin(2 * p + 1), 16 * sin(p), 0),
+            "ArmL": (4 * sin(2 * p), 0, 5 + 3 * sin(2 * p)), "ArmR": (4 * sin(2 * p + 1), 0, -5 - 3 * sin(2 * p)),
+            "ForeL": (-12, 0, 0), "ForeR": (-12, 0, 0),
+        }
+        if extra:
+            out.update(extra(t, False))
+        return out
+    c.animate({"Walk": (24, 1.0, walk), "Idle": (40, 4.0, idle)})
+
+
+# ============================================================== SWIMMER / SERPENT / FLOATER
+def spine(c, pts, names=None, parent="Root"):
+    """chain of bones through pts; returns names"""
+    names = names or ["Spine%d" % (i + 1) for i in range(len(pts) - 1)]
+    prev = parent
+    for i in range(len(pts) - 1):
+        c.bone(names[i], pts[i], pts[i + 1], prev)
+        prev = names[i]
+    return names
+
+
+def swim_anims(c, chain, fins=(), amp=10, axis="yaw", rate=1, extra=None, hover=0.4):
+    """undulating body: each chain bone rotates with a travelling wave. axis yaw (snake/fish) or pitch (whale)"""
+    def mk(speed, a_mul):
+        def fn(t):
+            p = tau * t * rate
+            out = {"Root": ((0, 0, 0), (0, hover * sin(p if speed < 1 else 2 * p), 0))}
+            for i, n in enumerate(chain):
+                ang = amp * a_mul * sin(p * speed - i * 0.9) * (0.4 + 0.6 * i / max(1, len(chain) - 1))
+                out[n] = (ang, 0, 0) if axis == "pitch" else (0, ang, 0)
+            for i, (n, side) in enumerate(fins):
+                out[n] = (0, 0, side * (14 * a_mul) * sin(p * speed * 1.3 + i))
+            if extra:
+                out.update(extra(t, speed > 1))
+            return out
+        return fn
+    c.animate({"Walk": (24, 1.0, mk(2, 1.3)), "Idle": (40, 4.0, mk(1, 0.8))})
+
+
+def aura(c, style, color, color2=None, rarity=None):
+    c.extra.update({"aura": {"style": style, "color": list(color), "color2": list(color2 or color)}})
+    if rarity:
+        c.extra["rarity"] = rarity
+
+
+def stripes(col, axis="z", period=0.7, width=0.3, wobble=0.25, only=None):
+    """painted stripes (per pixel). axis z = bands around the body. only = fn(x,y,z)->bool array"""
+    def mask(X, Y, Z):
+        U = {"z": Z, "y": Y, "x": X}[axis] + wobble * np.sin(X * 2.2 + Y * 1.3) + 0.12 * np.sin(Y * 5.1)
+        m = np.mod(U, period) < width * (0.75 + 0.25 * np.cos(X * 1.7))
+        if only is not None:
+            m &= only(X, Y, Z)
+        return m
+    return (col, mask)
+
+
+def spots(col, size=0.5, density=0.3, seed=1, only=None):
+    def mask(X, Y, Z):
+        cx, cy, cz = np.floor(X / size), np.floor(Y / size), np.floor(Z / size)
+        h = np.sin(cx * 12.9898 + cy * 78.233 + cz * 37.719 + seed) * 43758.5453
+        h = h - np.floor(h)
+        fx, fy, fz = X / size - cx - 0.5, Y / size - cy - 0.5, Z / size - cz - 0.5
+        m = (h < density) & (fx * fx + fy * fy + fz * fz < 0.16)
+        if only is not None:
+            m &= only(X, Y, Z)
+        return m
+    return (col, mask)
+
+
+def band(col, lo, hi, axis="y"):
+    """solid painted region between two heights (e.g. a darker back / lighter belly)"""
+    def mask(X, Y, Z):
+        U = {"z": Z, "y": Y, "x": X}[axis]
+        return (U >= lo) & (U <= hi)
+    return (col, mask)
+
+##### FILE: creature_pipeline/detail.py #####
+"""Detail toolkit for the fierce armoured / royal / elemental creatures (batch 10+).
+
+Everything here is written in GAME space: V(x, y, z) with y up, z back, front = -z. B() converts to
+blender. The look is faceted (low segment counts, flat shading) like the owner's reference models:
+shard fur clumps, crisp armour plates with trims, glowing angry eyes, open jaws with sharp teeth.
+"""
+import math, random
+from kit import *
+import bmesh
+import numpy as np
+from mathutils import Vector, Matrix, Euler
+from mathutils.bvhtree import BVHTree
+
+R = math.radians
+GM = G.to_4x4()
+TOOTH = C(250, 248, 236)
+MOUTH = C(85, 12, 22)
+TONGUE = C(215, 70, 95)
+
+
+def V(x, y=None, z=None):
+    if y is None:
+        return Vector(x)
+    return Vector((x, y, z))
+
+
+def B(v):
+    return P(v[0], v[1], v[2])
+
+
+def grot(rx=0, ry=0, rz=0):
+    return Euler((R(rx), R(ry), R(rz)), "XYZ").to_matrix()
+
+
+def mirror(v):
+    return V(-v.x, v.y, v.z)
+
+
+def _finish(c, bm, color, bones, **kw):
+    bmesh.ops.transform(bm, matrix=GM, verts=bm.verts)     # game -> blender
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    return c._add(bm, color, bones, **kw)
+
+
+# ------------------------------------------------------------------ basic wrappers (game space)
+def E(c, ctr, rad, col, bones, rot=None, seg=(10, 7), **kw):
+    return c.ellipsoid(B(ctr), rad, col, bones, rot=euler(*rot) if rot else None, seg=seg, **kw)
+
+
+def T(c, pts, radii, col, bones, seg=8, sub=2, **kw):
+    return c.tube([B(p) for p in pts], radii, col, bones, seg=seg, sub=sub, **kw)
+
+
+def S(c, base, tip, r, col, bones, bend=None, seg=4, n=3, **kw):
+    """faceted spike (pyramid by default)"""
+    return c.spike(B(base), B(tip), r, col, bones, bend=B(bend) if bend is not None else None, seg=seg, n=n, **kw)
+
+
+def BOX(c, ctr, half, col, bones, rot=None, **kw):
+    return c.box(B(ctr), half, col, bones, rot=euler(*rot) if rot else None, **kw)
+
+
+def SHEET(c, pts, col, bones, thick=0.15, **kw):
+    return c.sheet([B(p) for p in pts], col, bones, thick=thick, **kw)
+
+
+def crystal(c, base, tip, r, col, bones, **kw):
+    d = tip - base
+    return T(c, [base - d * 0.08, base + d * 0.7, tip], [r, r, 0.02], col, bones, seg=6, sub=1, **kw)
+
+
+# ------------------------------------------------------------------ shard fur
+def shard(c, base, tip, width, col, bones, n=None, thick=0.38, mid=0.42, bulge=1.12, lift=0.1, **kw):
+    """one faceted fur clump / scale / feather: flat diamond blade lying on the surface (normal n)"""
+    d = tip - base
+    L = d.length
+    dn = d / L
+    n = V(0, 1, 0) if n is None else n.copy()
+    n = n - dn * n.dot(dn)
+    if n.length < 1e-4:
+        n = dn.orthogonal()
+    n.normalize()
+    w = dn.cross(n).normalized()
+    bm = bmesh.new()
+
+    def ring(p, s):
+        hw, ht = width * 0.5 * s, width * thick * 0.5 * s
+        return [bm.verts.new(p + w * hw), bm.verts.new(p + n * ht), bm.verts.new(p - w * hw), bm.verts.new(p - n * ht)]
+    r0 = ring(base, 0.8)
+    r1 = ring(base + d * mid + n * L * lift * 0.5, bulge)
+    tp = bm.verts.new(tip + n * L * lift)
+    for i in range(4):
+        j = (i + 1) % 4
+        bm.faces.new((r0[i], r0[j], r1[j], r1[i]))
+        bm.faces.new((r1[i], r1[j], tp))
+    bm.faces.new(list(reversed(r0)))
+    return _finish(c, bm, col, bones, **kw)
+
+
+def fibo(n):
+    ga = math.pi * (3 - math.sqrt(5))
+    out = []
+    for i in range(n):
+        y = 1 - 2 * (i + 0.5) / n
+        r = math.sqrt(max(0, 1 - y * y))
+        out.append(V(math.cos(ga * i) * r, y, math.sin(ga * i) * r))
+    return out
+
+
+def fur(c, ctr, rad, col, bones, n=80, length=0.9, width=0.55, flow=V(0, -1, 0.3), where=None, col2=None, mix=0.35,
+        seed=1, rot=None, lift=0.45, jitter=0.3, thick=0.38, sink=0.3, glow2=False, wjit=0.2):
+    """cover part of an ellipsoid in shard clumps. where(u, p) filters by unit-sphere dir u / point p.
+    flow = Vector or fn(p, normal) -> Vector (direction the fur lies)."""
+    rng = random.Random(seed)
+    M = grot(*rot) if rot else Matrix.Identity(3)
+    count = 0
+    for u in fibo(n):
+        p = ctr + M @ V(u.x * rad[0], u.y * rad[1], u.z * rad[2])
+        if where and not where(u, p):
+            continue
+        nrm = (M @ V(u.x / rad[0], u.y / rad[1], u.z / rad[2])).normalized()
+        f = flow(p, nrm) if callable(flow) else flow.copy()
+        f = f - nrm * f.dot(nrm)
+        if f.length < 1e-3:
+            f = nrm.orthogonal()
+        f.normalize()
+        dirv = (f + nrm * lift).normalized()
+        ln = length * (1 + rng.uniform(-jitter, jitter))
+        wd = width * (1 + rng.uniform(-wjit, wjit))
+        base = p - dirv * ln * 0.18 - nrm * wd * thick * sink
+        cc = col2 if (col2 is not None and rng.random() < mix) else col
+        shard(c, base, base + dirv * ln, wd, cc, bones, n=nrm, thick=thick, glow=bool(glow2 and cc == col2))
+        count += 1
+    return count
+
+
+def fur_line(c, pts, col, bones, length=0.9, width=0.5, out=None, n_per=3, col2=None, seed=2, lift=0.6, thick=0.4, jitter=0.25):
+    """row of shards along a polyline (manes, ridges, cheek tufts). out = fn(p) -> direction"""
+    rng = random.Random(seed)
+    for i in range(len(pts) - 1):
+        for k in range(n_per):
+            t = (k + rng.uniform(0.1, 0.9)) / n_per
+            p = pts[i].lerp(pts[i + 1], t)
+            d = out(p) if callable(out) else out
+            d = d.normalized()
+            ln = length * (1 + rng.uniform(-jitter, jitter))
+            seg_dir = (pts[i + 1] - pts[i]).normalized()
+            nrm = d.cross(seg_dir).cross(d) if abs(d.dot(seg_dir)) < 0.99 else d.orthogonal()
+            cc = col2 if (col2 is not None and rng.random() < 0.4) else col
+            shard(c, p - d * ln * 0.15, p + d * ln, width * (1 + rng.uniform(-0.2, 0.2)), cc, bones, n=nrm, thick=thick, lift=0.05)
+
+
+# ------------------------------------------------------------------ armour
+def shell(c, ctr, rad, col, bones, th=(-60, 60), ph=(-30, 60), off=0.06, thick=0.16, seg=(6, 4), rot=None,
+          trim=None, inset=0.16, **kw):
+    """curved armour plate over part of an ellipsoid. th = azimuth range in degrees (0 = front -z, 90 = +x,
+    180 = back), ph = elevation range. trim=colour -> plate in trim colour + raised inset panel in col."""
+    M = grot(*rot) if rot else Matrix.Identity(3)
+    kw.setdefault("stud", False)          # armour plates are clean hard surfaces
+
+    def surf(t, p, o):
+        t, p = R(t), R(p)
+        u = V(math.sin(t) * math.cos(p), math.sin(p), -math.cos(t) * math.cos(p))
+        pt = V(u.x * rad[0], u.y * rad[1], u.z * rad[2])
+        nr = V(u.x / rad[0], u.y / rad[1], u.z / rad[2]).normalized()
+        return ctr + M @ (pt + nr * o)
+
+    def slab(t0, t1, p0, p1, o0, o1, color, **k2):
+        bm = bmesh.new()
+        nu, nv = seg
+        A = [[bm.verts.new(surf(t0 + (t1 - t0) * i / nu, p0 + (p1 - p0) * j / nv, o1)) for j in range(nv + 1)] for i in range(nu + 1)]
+        Bq = [[bm.verts.new(surf(t0 + (t1 - t0) * i / nu, p0 + (p1 - p0) * j / nv, o0)) for j in range(nv + 1)] for i in range(nu + 1)]
+        for i in range(nu):
+            for j in range(nv):
+                bm.faces.new((A[i][j], A[i + 1][j], A[i + 1][j + 1], A[i][j + 1]))
+                bm.faces.new((Bq[i][j], Bq[i][j + 1], Bq[i + 1][j + 1], Bq[i + 1][j]))
+        edge = [(i, 0) for i in range(nu)] + [(nu, j) for j in range(nv)] + [(i, nv) for i in range(nu, 0, -1)] + [(0, j) for j in range(nv, 0, -1)]
+        for k in range(len(edge)):
+            (i1, j1), (i2, j2) = edge[k], edge[(k + 1) % len(edge)]
+            bm.faces.new((A[i1][j1], Bq[i1][j1], Bq[i2][j2], A[i2][j2]))
+        return _finish(c, bm, color, bones, **k2)
+
+    if trim is None:
+        return slab(th[0], th[1], ph[0], ph[1], off, off + thick, col, **kw)
+    slab(th[0], th[1], ph[0], ph[1], off, off + thick, trim, **kw)
+    dt, dp = (th[1] - th[0]) * inset, (ph[1] - ph[0]) * inset
+    return slab(th[0] + dt, th[1] - dt, ph[0] + dp, ph[1] - dp, off + thick * 0.5, off + thick * 1.5, col, **kw)
+
+
+def cuff(c, a, b, r, col, bones, thick=0.14, seg=8, flare=0.15, spikes=0, spike_col=None, spike_len=0.5, **kw):
+    """armour ring / gauntlet / greave around a limb from a to b (game). r = inner radius at the middle"""
+    kw.setdefault("stud", False)
+    d = b - a
+    dn = d.normalized()
+    s1 = dn.cross(V(0, 1, 0)) if abs(dn.y) < 0.95 else dn.cross(V(1, 0, 0))
+    s1.normalize()
+    s2 = dn.cross(s1).normalized()
+    bm = bmesh.new()
+    prof = [(0.0, r + flare), (0.5, r), (1.0, r + flare)]
+    outer, inner = [], []
+    for t, rr in prof:
+        ctr = a + d * t
+        dirs = [s1 * math.cos(k / seg * math.tau) + s2 * math.sin(k / seg * math.tau) for k in range(seg)]
+        outer.append([bm.verts.new(ctr + q * (rr + thick)) for q in dirs])
+        inner.append([bm.verts.new(ctr + q * rr) for q in dirs])
+    for i in range(len(prof) - 1):
+        for k in range(seg):
+            k2 = (k + 1) % seg
+            bm.faces.new((outer[i][k], outer[i][k2], outer[i + 1][k2], outer[i + 1][k]))
+            bm.faces.new((inner[i][k], inner[i + 1][k], inner[i + 1][k2], inner[i][k2]))
+    for ro, ri in ((outer[0], inner[0]), (outer[-1], inner[-1])):
+        for k in range(seg):
+            k2 = (k + 1) % seg
+            bm.faces.new((ro[k], ri[k], ri[k2], ro[k2]))
+    _finish(c, bm, col, bones, **kw)
+    if spikes:
+        mid = a + d * 0.5
+        for k in range(spikes):
+            q = s1 * math.cos(k / spikes * math.tau + 0.3) + s2 * math.sin(k / spikes * math.tau + 0.3)
+            S(c, mid + q * (r + thick * 0.6), mid + q * (r + thick + spike_len) + dn * spike_len * 0.3, thick * 1.6, spike_col or col, bones, stud=False)
+
+
+def crown(c, ctr, rad, h, col, bones, n=5, gem=None, tilt=(0, 0, 0), thick=0.18, tall=1.5, emblem=True, points="spike", stud=False):
+    """royal crown: ring band + n tall points + front emblem with a glowing gem"""
+    M = grot(*tilt)
+    cuff(c, ctr, ctr + M @ V(0, h, 0), rad, col, bones, thick=thick, seg=max(10, n * 2), flare=0.06, stud=stud)
+    for i in range(n):
+        a = i / n * math.tau
+        dirv = V(math.sin(a), 0, -math.cos(a))
+        tang = V(math.cos(a), 0, math.sin(a))
+        ph = h * tall * (1.25 if i == 0 else 1.0)
+        base = ctr + M @ (dirv * (rad + thick * 0.5) + V(0, h * 0.85, 0))
+        w = rad * math.tau / n * 0.36
+        tip = base + M @ (V(0, ph, 0) + dirv * 0.08 * ph)
+        SHEET(c, [base - M @ tang * w, base + M @ tang * w, tip], col, bones, thick=thick * 1.2, stud=stud)
+        if gem:
+            E(c, tip - M @ V(0, ph * 0.15, 0) + M @ dirv * thick * 0.6, (0.09 * rad * 1.5,) * 3, gem, bones, seg=(6, 4), glow=True)
+    if emblem:
+        f = ctr + M @ V(0, h * 0.55, -(rad + thick))
+        BOX(c, f, (h * 0.42, h * 0.42, thick * 0.6), col, bones, rot=(tilt[0], tilt[1], 45 + tilt[2]), stud=stud)
+        if gem:
+            BOX(c, f + M @ V(0, 0, -thick * 0.45), (h * 0.24, h * 0.24, thick * 0.4), gem, bones, rot=(tilt[0], tilt[1], 45 + tilt[2]), glow=True)
+
+
+# ------------------------------------------------------------------ face
+def _snap(c, point, direction, bones, max_dist=3.0):
+    d = direction.normalized()
+    start = point + d * max_dist
+    best = None
+    bset = set(bones if isinstance(bones, (list, tuple)) else [bones])
+    for sh in c.shapes:
+        if sh["glow"] or not (set(sh["bones"]) & bset):
+            continue
+        hit = BVHTree.FromBMesh(sh["bm"]).ray_cast(start, -d, max_dist * 2)
+        if hit[0] is not None:
+            dist = (hit[0] - start).length
+            if best is None or dist < best[1]:
+                best = (hit[0], dist, hit[1])
+    return (best[0], best[2]) if best else (point, d)
+
+
+def fierce_eye(c, center, size, bones, facing=None, glow=C(255, 45, 45), core=C(255, 150, 120), brow=None,
+               slant=20, socket=C(25, 10, 12), brow_len=1.2, brow_lift=0.62, snap=True):
+    """glowing angry eye: dark socket, slanted glowing almond (inner corner down), hot core, angry brow"""
+    cb, fb = B(center), B(facing if facing is not None else V(0, 0, -1)).normalized()
+    if snap:
+        cb, nrm = _snap(c, cb, fb, bones)
+        fb = (fb * 0.5 + nrm.normalized() * 0.5).normalized()
+    f = fb
+    inner = Vector((-math.copysign(1, cb.x) if abs(cb.x) > 1e-4 else 1, 0, 0))
+    sv = f.cross(Vector((0, 0, 1)))
+    if sv.length < 1e-3:
+        sv = Vector((1, 0, 0))
+    sv.normalize()
+    if sv.dot(inner) < 0:
+        sv = -sv
+    up = Vector((0, 0, 1)) - f * f.z
+    up = (up - sv * up.dot(sv)).normalized()
+
+    def axes(deg):
+        a = R(deg)
+        return sv * math.cos(a) - up * math.sin(a), up * math.cos(a) + sv * math.sin(a)
+
+    def ell(off, rad, col, X, Y, gl):
+        bm = bmesh.new()
+        bmesh.ops.create_uvsphere(bm, u_segments=10, v_segments=7, radius=1.0)
+        Mx = Matrix((X, f, Y)).transposed().to_4x4()
+        m = Matrix.Translation(cb + X * off[0] + f * off[1] + Y * off[2]) @ Mx @ Matrix.Diagonal((rad[0], rad[1], rad[2], 1))
+        bmesh.ops.transform(bm, matrix=m, verts=bm.verts)
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+        c._add(bm, col, bones, glow=gl, stud=False)
+    s = size
+    ax, bx = axes(slant)
+    ell((0, -s * 0.1, 0), (s * 0.95, s * 0.2, s * 0.6), socket, ax, bx, False)
+    ell((0, 0.0, 0), (s * 0.74, s * 0.14, s * 0.38), glow, ax, bx, True)
+    ell((-s * 0.08, s * 0.04, s * 0.02), (s * 0.2, s * 0.12, s * 0.14), core, ax, bx, True)
+    if brow:
+        ax2, bx2 = axes(slant * 1.6)
+        bm = bmesh.new()
+        bmesh.ops.create_cube(bm, size=2.0)
+        Mx = Matrix((ax2, f, bx2)).transposed().to_4x4()
+        m = Matrix.Translation(cb + bx * s * brow_lift + f * s * 0.08 + ax * s * 0.12) @ Mx @ Matrix.Diagonal((s * 0.78 * brow_len, s * 0.3, s * 0.22, 1))
+        bmesh.ops.transform(bm, matrix=m, verts=bm.verts)
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+        c._add(bm, brow, bones)
+
+
+def eyes_pair(c, ctr, dx, size, bones, **kw):
+    """both eyes; ctr = midpoint between the eyes (game), dx = half distance"""
+    turn = kw.pop("turn", 0.45)
+    for s in (-1, 1):
+        fierce_eye(c, ctr + V(s * dx, 0, 0), size, bones, facing=V(s * turn, 0.05, -1), **kw)
+
+
+def maw(c, F, w, d, gap, upper, jaw, n=8, tooth=0.24, fangs=1.8, teeth_col=TOOTH, mouth_col=MOUTH, tongue_col=TONGUE,
+        lower_teeth=True, tongue=True, inner=True):
+    """open mouth with rows of sharp teeth. F = front centre of the mouth opening (game), w = half width,
+    d = depth back to the corners, gap = opening height. Upper teeth on `upper` bone, lower on `jaw`."""
+    if inner:
+        E(c, F + V(0, 0, d * 0.78), (w * 0.95, gap * 0.6, d * 0.85), mouth_col, [upper], stud=False, seg=(10, 7))
+    if tongue:
+        E(c, F + V(0, -gap * 0.3, d * 0.5), (w * 0.6, gap * 0.17, d * 0.62), tongue_col, [jaw], stud=False, seg=(8, 6))
+    rows = [(gap * 0.5, -1, upper, 1.0)] + ([(-gap * 0.5, 1, jaw, 0.8)] if lower_teeth else [])
+    for yy, sgn, bone, scale in rows:
+        for i in range(n):
+            t = -1 + 2 * i / (n - 1)
+            x = t * w * 0.9
+            z = F.z + d * t * t * 0.95 + 0.04
+            canine = abs(abs(t) - 0.62) < 0.15
+            ln = tooth * (fangs if canine else 1.0) * scale
+            base = V(x, F.y + yy - sgn * 0.04, z)
+            tip = base + V(-x * 0.04, sgn * ln, 0)
+            S(c, base, tip, tooth * 0.38 * (1.2 if canine else 1), teeth_col, bone, stud=False)
+
+
+def ram_horn(c, base, s, size, col, bones, turns=0.85, out=0.5, yaw=25, ribs=True, seg=7, r0=None, **kw):
+    """curled ram horn starting at `base` (game) on side s: goes up, back, down and forward, drifting outward"""
+    M = grot(0, s * yaw, 0)
+    pts, radii = [], []
+    n = 16
+    r0 = r0 or size * 0.42
+    for i in range(n + 1):
+        k = i / n
+        a = k * turns * math.tau
+        rr = size * (1 - 0.45 * k)
+        off = V(s * out * size * k * 1.6, rr * math.cos(a) - size, rr * math.sin(a))
+        pts.append(base + M @ off)
+        r = r0 * (1 - 0.82 * k) + 0.04
+        radii.append(r * (1.12 if ribs and i % 2 else 1.0))
+    return T(c, pts, radii, col, bones, seg=seg, sub=1, **kw)
+
+
+def swept_horn(c, pts, r, col, bones, seg=6, ribs=False, **kw):
+    n = len(pts)
+    radii = [r * (1 - 0.88 * i / (n - 1)) + 0.03 for i in range(n)]
+    if ribs:
+        radii = [rr * (1.1 if i % 2 else 1) for i, rr in enumerate(radii)]
+    return T(c, pts, radii, col, bones, seg=seg, sub=2 if not ribs else 1, **kw)
+
+
+# ------------------------------------------------------------------ painted patterns
+def filigree(col, scale=1.0, width=0.09, only=None):
+    """swirling gold trim lines"""
+    def mask(X, Y, Z):
+        u = np.sin(X * 1.7 * scale + np.sin(Z * 1.3 * scale) * 1.8) + 0.8 * np.sin(Z * 1.1 * scale + np.sin(Y * 1.9 * scale) * 1.5) + np.sin(Y * 1.4 * scale)
+        m = np.abs(u) < width * 3
+        if only is not None:
+            m &= only(X, Y, Z)
+        return m
+    return (col, mask)
+
+
+def cracks(col, scale=1.0, width=0.06, only=None):
+    """glowing-lava / lightning style crack network (painted)"""
+    def mask(X, Y, Z):
+        a = np.abs(np.sin(X * 2.1 * scale + np.sin(Y * 1.7 * scale) * 2.2 + Z * 0.7 * scale))
+        b = np.abs(np.sin(Z * 2.3 * scale + np.sin(X * 1.3 * scale) * 2.0 - Y * 0.9 * scale))
+        m = (a < width * 2.5) | (b < width * 2.0)
+        if only is not None:
+            m &= only(X, Y, Z)
+        return m
+    return (col, mask)
+
+
+def detailed(name, height):
+    """Creature preset for the detailed batch: smaller, subtler studs"""
+    c = Creature(name, height=height, stud=height / 44)
+    c.stud_k = 0.65
+    return c
+
+
+# ------------------------------------------------------------------ quadruped skeleton
+def beast(c, sh=4.2, hip=None, L=2.0, W=1.1, neck=(1.0, 1.0), head=1.5, tail=4, tail_len=1.0, tail_lift=0.25):
+    """quadruped skeleton compatible with kit.quad_anims (+ a Jaw bone). Chest at z=-L, hips at z=+L.
+    Returns key points (game Vectors)."""
+    hip = hip or sh
+    cz, hz = -L, L
+    mid = V(0, (hip + sh) / 2, 0)
+    c.bone("Root", P(0, 0, 0), P(0, 1, 0))
+    c.bone("Hips", B(V(0, hip, hz)), B(mid), "Root")
+    c.bone("Chest", B(mid), B(V(0, sh, cz)), "Hips")
+    nb = V(0, sh + 0.3, cz - 0.2)
+    hb = nb + V(0, neck[1], -neck[0])
+    c.bone("Neck", B(nb), B(hb), "Chest")
+    c.bone("Head", B(hb), B(hb + V(0, 0.1, -head)), "Neck")
+    c.bone("Jaw", B(hb + V(0, -0.35, -0.3)), B(hb + V(0, -0.7, -head)), "Head")
+    k = dict(sh=sh, hip=hip, cz=cz, hz=hz, W=W, nb=nb, hb=hb, mid=mid)
+    for s, X in ((-1, "L"), (1, "R")):
+        sho, elb, paw = V(s * W, sh - 0.2, cz), V(s * W * 1.05, sh * 0.5, cz - 0.15), V(s * W * 1.05, 0.35, cz - 0.1)
+        hp_, kn, ft = V(s * W * 0.95, hip - 0.2, hz), V(s * W * 1.02, hip * 0.52, hz - 0.45), V(s * W * 1.05, 0.35, hz + 0.15)
+        c.bone("Arm" + X, B(sho), B(elb), "Chest")
+        c.bone("Fore" + X, B(elb), B(paw), "Arm" + X)
+        c.bone("Thigh" + X, B(hp_), B(kn), "Hips")
+        c.bone("Shin" + X, B(kn), B(ft), "Thigh" + X)
+        k.update({"sho" + X: sho, "elb" + X: elb, "paw" + X: paw, "hip" + X: hp_, "knee" + X: kn, "foot" + X: ft})
+    t0, prev, tp = V(0, hip + 0.1, hz + 0.5), "Hips", []
+    tp.append(t0)
+    for i in range(tail):
+        t1 = t0 + V(0, tail_lift * (1 - i / max(1, tail)), tail_len)
+        c.bone("Tail%d" % (i + 1), B(t0), B(t1), prev)
+        prev, t0 = "Tail%d" % (i + 1), t1
+        tp.append(t1)
+    k["tail"] = tp
+    return k
+
+
+def leg(c, k, X, col, r=(0.62, 0.5, 0.42), paw_col=None, paw=(0.62, 0.36, 0.8), seg=7, front=True, paint=None, muscle=True):
+    """faceted leg along the skeleton: muscle mass at the top, upper + lower tube and a paw.
+    r = (top, joint, ankle) radius"""
+    r = tuple(v * 1.16 for v in r)            # owner wants sturdy, not skinny, legs
+    if front:
+        a, b, f, ub, lb = k["sho" + X], k["elb" + X], k["paw" + X], "Arm" + X, "Fore" + X
+    else:
+        a, b, f, ub, lb = k["hip" + X], k["knee" + X], k["foot" + X], "Thigh" + X, "Shin" + X
+    s = 1 if a.x > 0 else -1
+    if muscle:
+        L = (a - b).length
+        E(c, a.lerp(b, 0.32) + V(s * 0.05, 0, 0.1 if not front else 0), (r[0] * 1.22, L * 0.42, r[0] * (1.45 if not front else 1.3)), col, ub, seg=(9, 6), paint=paint)
+    T(c, [a + V(0, 0.2, 0), a.lerp(b, 0.5), b], [r[0] * 1.15, r[0], r[1]], col, ub, seg=seg, paint=paint)
+    E(c, b, (r[1] * 1.08, r[1] * 1.1, r[1] * 1.12), col, lb, seg=(8, 5), paint=paint)
+    T(c, [b, b.lerp(f, 0.5), f + V(0, 0.15, 0)], [r[1], r[2] * 1.05, r[2]], col, lb, seg=seg, paint=paint)
+    E(c, f + V(0, -0.05, -paw[2] * 0.35), paw, paw_col or col, lb, seg=(8, 5))
+    return b
+
+
+def claws3(c, f, col, bone, n=3, size=0.32, spread=0.32, z=-0.75):
+    for i in range(n):
+        o = (i - (n - 1) / 2) * spread
+        S(c, f + V(o, 0.15, z * 0.8), f + V(o * 1.15, -0.25, z - size * 1.4), size * 0.42, col, bone, bend=V(0, 0.18, 0), seg=4, n=4, stud=False)
+
+##### FILE: creature_pipeline/dino.py #####
+"""Prehistoric zone helpers: theropod (2-legged dino) skeleton + body, dino animations.
+Game space: V(x, y, z), y up, front = -z. Built on detail.py (faceted, detailed look)."""
+from detail import *
+
+
+def theropod(c, hip=4.2, L=1.8, W=1.0, neck=(1.0, 1.3), head=2.0, tail=5, tail_len=1.25, tail_drop=0.12,
+             arm=1.0, upright=0.35):
+    """2-legged dinosaur skeleton. Hips at z=+0.4, chest forward at z=-L. Legs: Thigh (down-forward),
+    Shin (down-back), Foot (forward toes). Small arms (Arm/Fore). Returns key points (game vectors)."""
+    hz, cz = 0.4, -L
+    c.bone("Root", P(0, 0, 0), P(0, 1, 0))
+    mid = V(0, hip + 0.15 + upright * 0.3, hz - L * 0.5)
+    c.bone("Hips", B(V(0, hip, hz)), B(mid), "Root")
+    chest = V(0, hip + 0.35 + upright * L * 0.5, cz)
+    c.bone("Chest", B(mid), B(chest), "Hips")
+    nb = chest + V(0, 0.25, -0.15)
+    hb = nb + V(0, neck[1], -neck[0])
+    c.bone("Neck", B(nb), B(hb), "Chest")
+    c.bone("Head", B(hb), B(hb + V(0, 0.05, -head)), "Neck")
+    c.bone("Jaw", B(hb + V(0, -0.4, -0.25)), B(hb + V(0, -0.75, -head)), "Head")
+    k = dict(hip=hip, hz=hz, cz=cz, W=W, nb=nb, hb=hb, mid=mid, chest=chest)
+    for s, X in ((-1, "L"), (1, "R")):
+        hp_ = V(s * W, hip - 0.15, hz)
+        kn = V(s * W * 1.08, hip * 0.55, hz - 0.75)
+        an = V(s * W * 1.1, hip * 0.2, hz + 0.25)
+        toe = V(s * W * 1.12, 0.25, hz - 0.85)
+        c.bone("Thigh" + X, B(hp_), B(kn), "Hips")
+        c.bone("Shin" + X, B(kn), B(an), "Thigh" + X)
+        c.bone("Foot" + X, B(an), B(toe), "Shin" + X)
+        sho = chest + V(s * W * 0.72, -0.55, 0.15)
+        el = sho + V(s * 0.25, -0.75 * arm, -0.1)
+        hd = el + V(0, -0.1, -0.75 * arm)
+        c.bone("Arm" + X, B(sho), B(el), "Chest")
+        c.bone("Fore" + X, B(el), B(hd), "Arm" + X)
+        k.update({"hip" + X: hp_, "knee" + X: kn, "ankle" + X: an, "toe" + X: toe, "sho" + X: sho, "elb" + X: el, "hand" + X: hd})
+    t0, prev, tp = V(0, hip + 0.05, hz + 0.7), "Hips", []
+    tp.append(t0)
+    for i in range(tail):
+        t1 = t0 + V(0, -tail_drop * (1 - i / max(1, tail)) + 0.05 * i / tail, tail_len)
+        c.bone("Tail%d" % (i + 1), B(t0), B(t1), prev)
+        prev, t0 = "Tail%d" % (i + 1), t1
+        tp.append(t1)
+    k["tail"] = tp
+    return k
+
+
+def theropod_legs(c, k, col, claw_col, r=(0.85, 0.55, 0.32), paint=None, toe_col=None, seg=7):
+    """powerful drumstick thighs, slim shins, 3-toed clawed feet"""
+    for s, X in ((-1, "L"), (1, "R")):
+        hp_, kn, an, toe = k["hip" + X], k["knee" + X], k["ankle" + X], k["toe" + X]
+        L = (hp_ - kn).length
+        E(c, hp_.lerp(kn, 0.35) + V(s * 0.08, 0, 0.05), (r[0] * 1.3, L * 0.55, r[0] * 1.55), col, "Thigh" + X, seg=(10, 7), paint=paint)
+        T(c, [hp_.lerp(kn, 0.3), kn], [r[0] * 1.05, r[1]], col, "Thigh" + X, seg=seg, paint=paint)
+        E(c, kn, (r[1] * 1.05, r[1] * 1.05, r[1] * 1.1), col, "Shin" + X, seg=(8, 5), paint=paint)
+        T(c, [kn, kn.lerp(an, 0.5), an], [r[1], r[1] * 0.8, r[2]], col, "Shin" + X, seg=seg, paint=paint)
+        E(c, an, (r[2] * 1.15, r[2] * 1.15, r[2] * 1.2), col, "Foot" + X, seg=(7, 5))
+        fc = toe_col or col
+        for j in (-1, 0, 1):
+            base = an + V(0, -0.05, -0.1)
+            tip = V(an.x + j * r[2] * 1.5, 0.22, toe.z - (0.15 if j == 0 else 0))
+            T(c, [base, base.lerp(tip, 0.5) + V(0, 0.05, 0), tip], [r[2] * 0.75, r[2] * 0.6, r[2] * 0.48], fc, "Foot" + X, seg=6)
+            S(c, tip + V(0, 0.1, 0.1), tip + V(j * 0.08, -0.15, -r[2] * 2.0), r[2] * 0.42, claw_col, "Foot" + X, bend=V(0, 0.15, 0), seg=4, n=4, stud=False)
+        S(c, an + V(0, 0.1, 0.15), an + V(0, -0.05, 0.75), r[2] * 0.4, claw_col, "Foot" + X, seg=4, n=3, stud=False)   # dew claw
+
+
+def tiny_arms(c, k, col, claw_col, r=0.26, fingers=2):
+    for s, X in ((-1, "L"), (1, "R")):
+        sh, el, hd = k["sho" + X], k["elb" + X], k["hand" + X]
+        T(c, [sh, el], [r * 1.25, r], col, "Arm" + X, seg=6)
+        T(c, [el, hd], [r, r * 0.8], col, "Fore" + X, seg=6)
+        for j in range(fingers):
+            o = (j - (fingers - 1) / 2) * r * 0.9
+            S(c, hd + V(o, 0, 0), hd + V(o, -0.35, -0.35), r * 0.45, claw_col, "Fore" + X, bend=V(0, 0.1, 0), seg=4, n=3, stud=False)
+
+
+def dino_tail(c, k, col, r0, col2=None, paint=None, seg=8, flat=(0.85, 1.0)):
+    tp = k["tail"]
+    n = len(tp) - 1
+    radii = [r0 * (1 - 0.88 * i / n) + 0.06 for i in range(n + 1)]
+    T(c, tp, radii, col, ["Tail%d" % (i + 1) for i in range(n)], seg=seg, paint=paint, flat=flat)
+    return radii
+
+
+def theropod_anims(c, tail=5, stride=30, bob=0.18, extra=None, lean=6, head_amp=1.0):
+    def walk(t):
+        p = tau * t
+        out = {
+            "Root": ((0, 0, 3 * sin(p)), (0, bob * abs(sin(p)) - bob * 0.5, 0)),
+            "Hips": (0, 5 * sin(p), 0),
+            "Chest": (2 * sin(2 * p), -4 * sin(p), 0),
+            "Neck": (-4 * sin(2 * p + 0.6) * head_amp, 3 * sin(p), 0),
+            "Head": (3 * sin(2 * p + 1.2) * head_amp, 0, 0),
+            "ThighL": (-stride * sin(p), 0, 0), "ThighR": (stride * sin(p), 0, 0),
+            "ShinL": (30 * max(0, sin(p + 0.6)), 0, 0), "ShinR": (30 * max(0, -sin(p + 0.6)), 0, 0),
+            "FootL": (-25 * max(0, sin(p + 1.0)), 0, 0), "FootR": (-25 * max(0, -sin(p + 1.0)), 0, 0),
+            "ArmL": (10 * sin(p), 0, 0), "ArmR": (-10 * sin(p), 0, 0),
+        }
+        for i in range(tail):
+            out["Tail%d" % (i + 1)] = (2 * sin(2 * p - i), (8 + 2 * i) * sin(p - 0.7 * i - 0.5), 0)
+        if extra:
+            out.update(extra(t, True))
+        return out
+
+    def idle(t):
+        p = tau * t
+        roar = max(0, sin(math.pi * (t - 0.55) / 0.3)) if 0.55 <= t <= 0.85 else 0.0
+        out = {
+            "Root": ((0, 0, 0), (0, 0.06 * sin(2 * p), 0)),
+            "Chest": (1.5 * sin(2 * p) - 3 * roar, 0, 0),
+            "Neck": (2 * sin(p) - 8 * roar, 16 * sin(p) * head_amp * (1 - roar), 0),
+            "Head": (3 * sin(2 * p + 1) + 14 * roar, 0, 5 * sin(p) * (1 - roar)),
+            "Jaw": (-3 - 26 * roar, 0, 0),
+            "ArmL": (6 * sin(2 * p), 0, 0), "ArmR": (6 * sin(2 * p + 1), 0, 0),
+        }
+        for i in range(tail):
+            out["Tail%d" % (i + 1)] = (1.5 * sin(p - i), (7 + 2 * i) * sin(p - 0.8 * i), 0)
+        if extra:
+            out.update(extra(t, False))
+        return out
+    c.animate({"Walk": (24, 1.0, walk), "Idle": (40, 4.0, idle)})
+
+
+def scale_row(c, pts, col, bones_fn, size=0.35, shrink=0.0, lean=0.4, side=False, **kw):
+    """row of back spikes/plates along a list of points. bones_fn(i) -> bone name"""
+    n = len(pts)
+    for i, p in enumerate(pts):
+        sz = size * (1 - shrink * abs(i - n / 2) / (n / 2))
+        S(c, p, p + V(0, sz * 1.6, sz * lean), sz * 0.45, col, bones_fn(i), seg=4, n=3, **kw)
+
+##### FILE: creature_pipeline/make.py #####
+"""python3 make.py <creature_module> [--render] [--export] [--walk]"""
+import sys, os, importlib, json
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "creatures"))
+mod = importlib.import_module(sys.argv[1])
+out = os.path.join(HERE, "out", sys.argv[1])
+c = mod.build()
+c.build(out)
+if hasattr(mod, "anims"):
+    mod.anims(c)
+tris = sum(len(p.vertices) - 2 for ob in c.mesh_objs.values() for p in ob.data.polygons)
+print("TRIS", tris, {k: len(o.data.polygons) for k, o in c.mesh_objs.items()})
+if "--render" in sys.argv:
+    angs = [30, 150] if "--two" in sys.argv else [30]
+    for a in angs:
+        c.render(os.path.join(out, f"{c.name}_{a}.png"), angle=a)
+if "--walk" in sys.argv:
+    c.pose_at("Walk", 6)
+    c.render(os.path.join(out, f"{c.name}_walk.png"), angle=70)
+if "--export" in sys.argv:
+    print("FBX", c.export(out))
+
+##### FILE: creature_pipeline/closeup.py #####
+import sys, os, importlib
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(HERE, "creatures"))
+mod = importlib.import_module(sys.argv[1]); c = mod.build(); out = os.path.join(HERE, "out", sys.argv[1]); c.build(out)
+c.render(os.path.join(out, c.name + "_30.png"), angle=30)
+c.render(os.path.join(out, c.name + "_close.png"), angle=20, elev=10, dist=0.55)
+
+##### FILE: creature_pipeline/sheet.py #####
+"""contact sheet: python3 sheet.py out.png id1 id2 ... (uses out/<id>/<Name>_30.png)"""
+import sys, os, glob
+from PIL import Image, ImageDraw
+out, ids = sys.argv[1], sys.argv[2:]
+ims = []
+for i in ids:
+    f = [p for p in glob.glob(f"out/{i}/*_30.png")]
+    ims.append((i, Image.open(f[0]).resize((500, 500))))
+cols = min(4, len(ims)); rows = (len(ims) + cols - 1) // cols
+S = Image.new("RGB", (cols * 500, rows * 500), "white")
+for k, (i, im) in enumerate(ims):
+    S.paste(im, ((k % cols) * 500, (k // cols) * 500))
+    ImageDraw.Draw(S).text(((k % cols) * 500 + 10, (k // cols) * 500 + 10), i, fill=(0, 0, 0))
+S.save(out)
+
+##### FILE: creature_pipeline/batch_fbx.py #####
+"""Merge single-creature FBXs into one FBX per batch (creatures side by side, 30 studs apart)."""
+import bpy, os, sys
+HERE = os.path.dirname(os.path.abspath(__file__))
+BATCHES = {
+    "Batch1_Divine": ["seraphlion", "sugarwing", "abysswhale", "tidetiger"],
+    "Batch2_Cosmic": ["nebulastag", "starowl", "cometwolf", "lunarmoth"],
+    "Batch3_Secret": ["pumpkinwarlock", "voidkraken", "glitchgolem", "shadowdrake"],
+    "Batch4_NewDivine": ["sunfirephoenix", "gumdrophydra", "coralleviathan", "halogriffin"],
+    "Batch5_NewCosmic": ["nebulafox", "crystalunicorn", "galaxymanta", "prismdragon"],
+    "Batch6_NewSecret": ["bonewyvern", "abyssangler", "hollowsteed", "thornbehemoth"],
+    "Batch7_Cute1": ["aurorakirin", "marshbear", "pearlturtle", "moonbunny"],
+    "Batch8_Cute2": ["saturnpig", "starhamster", "hextoad", "grimrhino"],
+    "Batch9_Cute3": ["scorpionking", "phantomgorilla", "chocomammoth", "bubbleseal"],
+    "Batch10_Royal": ["apeking", "lionemperor", "dragonoverlord", "crocpharaoh"],
+    "Batch11_Armoured": ["sentinelraptor", "ironwarwolf", "siegerhino", "mechscorpion"],
+    "Batch12_Elemental": ["frostyeti", "voidqilin", "infernohound", "stormbull"],
+    "Batch13_Dino1": ["tyrantrex", "razorraptor", "spinosaurus", "parasaur"],
+    "Batch14_Dino2": ["triceratops", "stegosaurus", "ankylosaurus", "brachiosaurus", "stormptero"],
+}
+only = [a for a in sys.argv[1:] if a.startswith("Batch")]
+if only:
+    BATCHES = {k: v for k, v in BATCHES.items() if k in only}
+outdir = os.path.join(HERE, "out", "batches")
+os.makedirs(outdir, exist_ok=True)
+for bname, ids in BATCHES.items():
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    for i, cid in enumerate(ids):
+        d = os.path.join(HERE, "out", cid)
+        fbx = [f for f in os.listdir(d) if f.endswith(".fbx")][0]
+        before = set(bpy.data.objects)
+        bpy.ops.import_scene.fbx(filepath=os.path.join(d, fbx), use_image_search=True)
+        new = [o for o in bpy.data.objects if o not in before]
+        for o in new:
+            if o.parent is None:
+                o.location.x += -i * 30.0   # blender -X = game +X
+    bpy.ops.file.pack_all()
+    path = os.path.join(outdir, bname + ".fbx")
+    bpy.ops.export_scene.fbx(filepath=path, use_selection=False, object_types={"ARMATURE", "MESH"},
+                             path_mode="COPY", embed_textures=True, axis_forward="-Z", axis_up="Y",
+                             add_leaf_bones=False, bake_anim=False, mesh_smooth_type="FACE", apply_scale_options="FBX_SCALE_ALL")
+    print("BATCH", bname, os.path.getsize(path))
+
+##### FILE: creature_pipeline/restcf.py #####
+"""rest CFrame of every bone in game space (relative to creature origin), matching Roblox import"""
+import sys, os, importlib, json, math
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(HERE, "creatures"))
+import bpy
+from mathutils import Matrix
+from sculpt import G
+def rest(cid):
+    mod = importlib.import_module(cid); c = mod.build()
+    # build only the armature (fast)
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    ad = bpy.data.armatures.new("A"); arm = bpy.data.objects.new("A", ad); bpy.context.scene.collection.objects.link(arm)
+    bpy.context.view_layer.objects.active = arm; bpy.ops.object.mode_set(mode="EDIT")
+    for n, h, t, p in c.bones:
+        eb = ad.edit_bones.new(n); eb.head, eb.tail = h, t; eb.roll = 0
+    bpy.ops.object.mode_set(mode="OBJECT")
+    out = []
+    for n, h, t, p in c.bones:
+        M = ad.bones[n].matrix_local
+        R = G @ M.to_3x3()          # bone axes expressed in game coords
+        pos = G @ M.to_translation()
+        out.append((n, p, [round(v, 3) for v in pos], [[round(R[i][j], 4) for j in range(3)] for i in range(3)]))
+    return c.name, out
+if __name__ == "__main__":
+    name, out = rest(sys.argv[1])
+    for n, p, pos, R in out:
+        # roblox XYZ euler from rotation matrix (R = Rx Ry Rz)
+        ry = math.asin(max(-1, min(1, R[0][2])))
+        rx = math.atan2(-R[1][2], R[2][2]); rz = math.atan2(-R[0][1], R[0][0])
+        print(n, pos, [round(math.degrees(a)) for a in (rx, ry, rz)])
+
+##### FILE: creature_pipeline/to_lua.py #####
+"""creature _data.json -> compact Luau ModuleScript source (one per creature)."""
+import json, os, sys, math
+HERE = os.path.dirname(os.path.abspath(__file__))
+OUT = os.path.join(HERE, "out", "lua")
+os.makedirs(OUT, exist_ok=True)
+
+
+def qmul_vec(q, v):
+    w, x, y, z = q
+    # rotate v by quaternion
+    ux, uy, uz = x, y, z
+    vx, vy, vz = v
+    cx = uy * vz - uz * vy; cy = uz * vx - ux * vz; cz = ux * vy - uy * vx
+    cx2 = uy * cz - uz * cy; cy2 = uz * cx - ux * cz; cz2 = ux * cy - uy * cx
+    return (vx + 2 * (w * cx + cx2), vy + 2 * (w * cy + cy2), vz + 2 * (w * cz + cz2))
+
+
+def num(x, d=3):
+    s = ("%." + str(d) + "f") % x
+    s = s.rstrip("0").rstrip(".") if "." in s else s
+    return "0" if s in ("-0", "") else s
+
+
+def convert(path):
+    d = json.load(open(path))
+    bones = d["bones"]
+    names = [b["name"] for b in bones]
+    lines = ["-- generated from Blender (" + d["name"] + "). Rotations per bone per frame (w,x,y,z, game axes)",
+             "-- + root offset per frame. Positions are rebuilt in game from the real bone positions.",
+             "return {", '\tName = "%s", Height = %s, Body = "%s",' % (d["name"], num(d["height"]), d.get("body", d["name"] + "_Body"))]
+    lines.append("\tBones = {" + ", ".join('{"%s", %s, Vector3.new(%s)}' % (b["name"], ('"%s"' % b["parent"]) if b["parent"] else "nil", ", ".join(num(v) for v in b["head"])) for b in bones) + "},")
+    glow = d.get("glow", {})
+    if isinstance(glow, dict):
+        lines.append("\tGlow = {" + ", ".join('["%s"] = "%s"' % (k, v) for k, v in glow.items()) + "},")
+    ex = d.get("extra", {})
+    au = ex.get("aura")
+    if au:
+        lines.append('\tAura = {Style = "%s", Color = Color3.fromRGB(%s), Color2 = Color3.fromRGB(%s)},' % (au["style"], ", ".join(map(str, au["color"])), ", ".join(map(str, au["color2"]))))
+    lines.append("\tHover = %s, Speed = %s," % (num(ex.get("hover", 0)), num(ex.get("speed", 1))))
+    lines.append("\tClips = {")
+    root_head = bones[0]["head"]
+    for clip, cd in d["anims"].items():
+        q, off = [], []
+        for fr in cd["frames"]:
+            for n in names:
+                w, x, y, z, tx, ty, tz = fr[n]
+                q.extend([w, x, y, z])
+            w, x, y, z, tx, ty, tz = fr[names[0]]
+            rh = qmul_vec((w, x, y, z), root_head)
+            off.extend([tx - (root_head[0] - rh[0]), ty - (root_head[1] - rh[1]), tz - (root_head[2] - rh[2])])
+        lines.append('\t\t%s = {Fps = %s, Frames = %d,' % (clip, num(cd["fps"]), len(cd["frames"])))
+        lines.append("\t\t\tQ = {" + ",".join(num(v, 3) for v in q) + "},")
+        lines.append("\t\t\tOff = {" + ",".join(num(v, 3) for v in off) + "}},")
+    lines.append("\t},")
+    lines.append("}")
+    src = "\n".join(lines)
+    out = os.path.join(OUT, d["name"] + ".lua")
+    open(out, "w").write(src)
+    return d["name"], len(src)
+
+
+if __name__ == "__main__":
+    tot = 0
+    for cid in open(os.path.join(HERE, "list.txt")).read().split():
+        dd = os.path.join(HERE, "out", cid)
+        js = [f for f in os.listdir(dd) if f.endswith("_data.json")][0]
+        n, sz = convert(os.path.join(dd, js))
+        tot += sz
+        print(n, sz)
+    print("TOTAL", tot)
+
+##### FILE: creature_pipeline/to_lua_compact.py #####
+"""compact creature data: quaternions packed as 12-bit x,y,z (w >= 0 rebuilt), 2 base64 chars each."""
+import json, os, sys, math
+HERE = os.path.dirname(os.path.abspath(__file__))
+OUT = os.path.join(HERE, "out", "lua_compact"); os.makedirs(OUT, exist_ok=True)
+from to_lua import qmul_vec
+A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+def enc(v):
+    q = max(0, min(4095, int(round((v + 1) * 2047.5))))
+    return A[q >> 6] + A[q & 63]
+def num(x, d=2):
+    s = ("%." + str(d) + "f") % x
+    s = s.rstrip("0").rstrip(".") if "." in s else s
+    return "0" if s in ("-0", "") else s
+def convert(path):
+    d = json.load(open(path)); bones = d["bones"]; names = [b["name"] for b in bones]
+    L = ['return {Name = "%s", Height = %s, Body = "%s",' % (d["name"], num(d["height"]), d.get("body", d["name"] + "_Body"))]
+    L.append("Bones = {" + ", ".join('{"%s", %s, Vector3.new(%s)}' % (b["name"], ('"%s"' % b["parent"]) if b["parent"] else "nil", ", ".join(num(v, 3) for v in b["head"])) for b in bones) + "},")
+    L.append("Glow = {" + ", ".join('["%s"] = "%s"' % (k, v) for k, v in d.get("glow", {}).items()) + "},")
+    ex = d.get("extra", {}); au = ex.get("aura")
+    if au:
+        L.append('Aura = {Style = "%s", Color = Color3.fromRGB(%s), Color2 = Color3.fromRGB(%s)}, Rarity = "%s",' % (au["style"], ", ".join(map(str, au["color"])), ", ".join(map(str, au["color2"])), ex.get("rarity", "")))
+    L.append("Hover = %s, Speed = %s," % (num(ex.get("hover", 0)), num(ex.get("speed", 1))))
+    L.append("Clips = {")
+    root_head = bones[0]["head"]
+    for clip, cd in d["anims"].items():
+        qs, off = [], []
+        for fr in cd["frames"]:
+            for n in names:
+                w, x, y, z = fr[n][:4]
+                if w < 0: w, x, y, z = -w, -x, -y, -z
+                qs.append(enc(x) + enc(y) + enc(z))
+            w, x, y, z, tx, ty, tz = fr[names[0]]          # root offset (as in to_lua.py)
+            rh = qmul_vec((w, x, y, z), root_head)
+            off += [num(tx - (root_head[0] - rh[0])), num(ty - (root_head[1] - rh[1])), num(tz - (root_head[2] - rh[2]))]
+        L.append('%s = {Fps = %s, Frames = %d, Qs = "%s", Off = {%s}},' % (clip, num(cd["fps"], 3), len(cd["frames"]), "".join(qs), ",".join(off)))
+    L.append("}}")
+    src = "\n".join(L)
+    open(os.path.join(OUT, d["name"] + ".lua"), "w").write(src)
+    return d["name"], len(src)
+if __name__ == "__main__":
+  ids = sys.argv[1:] or open(os.path.join(HERE, "list.txt")).read().split()
+  for i in ids:
+      dj = [f for f in os.listdir(os.path.join(HERE, "out", i)) if f.endswith("_data.json")][0]
+      print(*convert(os.path.join(HERE, "out", i, dj)))
+
+##### FILE: creature_pipeline/gen_rbxmx.py #####
+"""CreatureData.rbxmx: one ModuleScript per creature (compact anims + bone rest CFrames + batch layout)."""
+import os, sys, json, math
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import bpy
+from mathutils import Matrix
+import restcf
+import to_lua_compact as tlc
+RY180 = Matrix(((-1, 0, 0), (0, 1, 0), (0, 0, -1)))
+src = open(os.path.join(HERE, "batch_fbx.py")).read()
+BATCHES = eval(src[src.index("BATCHES = {") + 10: src.index("}\nonly") + 1])
+items = []
+for bname, ids in BATCHES.items():
+    for i, cid in enumerate(ids):
+        name, rest = restcf.rest(cid)
+        dj = [f for f in os.listdir(f"{HERE}/out/{cid}") if f.endswith("_data.json")][0]
+        nm, _ = tlc.convert(f"{HERE}/out/{cid}/{dj}")
+        lua = open(f"{HERE}/out/lua_compact/{nm}.lua").read().rstrip()
+        assert lua.endswith("}}")
+        rs = []
+        for n, p, pos, R in rest:
+            M = Matrix(R) @ RY180
+            q = M.to_quaternion()
+            if q.w < 0: q = -q
+            rs.append("CFrame.new(%s)" % ", ".join("%g" % round(v, 4) for v in (pos[0], pos[1], pos[2], q.x, q.y, q.z, q.w)))
+        extra = 'Rest = {%s},\nBatch = "%s", BatchIndex = %d,\n' % (", ".join(rs), bname, i)
+        lua = lua[:-1] + ",\n" + extra + "}"
+        items.append((nm, lua))
+        print(nm, len(lua), flush=True)
+xml = ['<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">',
+       '<Item class="Folder" referent="RBX0"><Properties><string name="Name">CreatureData</string></Properties>']
+for k, (nm, lua) in enumerate(items):
+    assert "]]>" not in lua
+    xml.append('<Item class="ModuleScript" referent="RBX%d"><Properties><string name="Name">%s</string><ProtectedString name="Source"><![CDATA[%s]]></ProtectedString></Properties></Item>' % (k + 1, nm, lua))
+xml.append("</Item></roblox>")
+open(os.path.join(HERE, "out", "CreatureData.rbxmx"), "w").write("\n".join(xml))
+print("TOTAL", sum(len(l) for _, l in items))
+
+##### FILE: creature_pipeline/creatures/moonbunny.py #####
+"""MOON BUNNY (Cosmic): chunky lavender star bunny, huge ears, crescent moon on the forehead, comet puff tail."""
+from kit import *
+
+FUR, FUR2, CREAM, PINK, MOON, STAR = C(190, 170, 245), C(150, 125, 225), C(250, 245, 255), C(255, 160, 210), C(255, 230, 120), C(255, 250, 215)
+
+
+def build():
+    c = Creature("MoonBunny", height=8)
+    star = spots(STAR, size=0.35, density=0.14, seed=23)
+    k = quad(c, FUR, belly=CREAM, L=0.8, H=0.82, W=1.3, leg=1.15, paw=CREAM, tail=1, paint=star, chunk=1.15)
+    h, sh = k["head"], k["sh_y"]
+    c.ellipsoid(h + P(0, 0.3, -0.4), (1.35, 1.2, 1.2), FUR, "Head", seg=(22, 14), paint=star)
+    c.ellipsoid(h + P(0, -0.1, -1.35), (0.7, 0.5, 0.45), CREAM, "Head")
+    c.ellipsoid(h + P(0, 0.08, -1.78), (0.18, 0.12, 0.1), PINK, "Head", stud=False, smooth=True)
+    for s in (-1, 1):
+        c.eye(h + P(s * 0.55, 0.5, -1.3), 0.32, P(s * 0.5, 0.05, -1), "Head")
+        c.ellipsoid(h + P(s * 0.9, 0.0, -1.1), (0.25, 0.16, 0.12), PINK, "Head", stud=False)
+        # huge ears (one bent at the tip)
+        e0 = h + P(s * 0.5, 1.2, -0.2)
+        e1 = e0 + P(s * 0.3, 1.6, 0.25)
+        e2 = e1 + (P(s * 0.9, 0.6, 0.5) if s > 0 else P(s * 0.2, 1.3, 0.2))
+        c.tube([e0, e1, e2], [0.42, 0.45, 0.25], FUR, ["Head"], seg=10, flat=(1.0, 0.55))
+        c.tube([e0 + P(0, 0.2, -0.22), e1 + P(0, 0, -0.22), e2 + P(0, 0, -0.18)], [0.22, 0.27, 0.12], PINK, ["Head"], seg=8, flat=(1.0, 0.4))
+    # crescent moon mark on the forehead (glowing)
+    pts = [h + P(math.sin(math.radians(a)) * 0.45, 0.95 + math.cos(math.radians(a)) * 0.35, -1.1 - 0.15 * math.cos(math.radians(a))) for a in range(-100, 101, 25)]
+    c.tube(pts, [0.04, 0.08, 0.11, 0.12, 0.12, 0.12, 0.11, 0.08, 0.04], MOON, ["Head"], seg=6, glow=True)
+    # chubby chest fluff + comet puff tail
+    for j in range(5):
+        c.spike(P((j - 2) * 0.4, sh + 0.1, k["chest_z"] - 0.9), P((j - 2) * 0.5, sh - 0.8, k["chest_z"] - 1.2), 0.38, CREAM, "Chest", seg=6)
+    tail = P(0, sh + 0.3, k["hip_z"] + 1.2)
+    c.ellipsoid(tail, (0.75, 0.75, 0.7), CREAM, "Tail1", seg=(16, 10))
+    for j in range(3):
+        c.leaf(tail + P(0, 0.2, 0.3), P((j - 1) * 0.5, 0.3, 1), P(1, 0, 0), 1.3, 0.5, MOON if j == 1 else STAR, "Tail1", thick=0.2, shape="flame", glow=True)
+    aura(c, "orbit", (200, 170, 255), (255, 230, 140), "Cosmic")
+    return c
+
+
+def anims(c):
+    def extra(t, walking):
+        p = tau * t
+        if walking:   # bunny hop: back legs together, front legs together
+            return {"Root": ((0, 0, 0), (0, 0.45 * abs(sin(p)), 0)), "ArmL": (30 * sin(p), 0, 0), "ArmR": (30 * sin(p), 0, 0),
+                    "ThighL": (-30 * sin(p), 0, 0), "ThighR": (-30 * sin(p), 0, 0), "Chest": (-6 * sin(p), 0, 0)}
+        return {"Head": (5 * sin(2 * p), 0, 10 * sin(p))}
+    quad_anims(c, tail=1, stride=0, bob=0.0, extra=extra)
+
+##### FILE: creature_pipeline/creatures/nebulafox.py #####
+"""NEBULA FOX (Cosmic): mystical fox with five fanned galaxy tails, big ears and starry fur."""
+from kit import *
+
+FUR, FUR2, CREAM, PAW, GLOW, PINK, STAR = C(95, 70, 190), C(140, 105, 225), C(245, 235, 255), C(50, 35, 110), C(120, 230, 255), C(255, 140, 220), C(255, 250, 210)
+
+
+def build():
+    c = Creature("NebulaFox", height=8.5)
+    star = spots(STAR, size=0.36, density=0.16, seed=13)
+    k = quad(c, FUR, belly=CREAM, L=1.0, H=0.95, W=0.95, leg=0.95, paw=PAW, tail=0, paint=star)
+    h, sh = k["head"], k["sh_y"]
+    # fluffy chest
+    for j in range(5):
+        c.spike(P((j - 2) * 0.35, sh + 0.2, k["chest_z"] - 0.7), P((j - 2) * 0.45, sh - 0.9, k["chest_z"] - 1.0), 0.35, CREAM, "Chest", seg=6)
+    # head
+    c.ellipsoid(h + P(0, 0.25, -0.45), (1.05, 0.9, 1.0), FUR, "Head", seg=(18, 12), paint=star)
+    c.tube([h + P(0, 0.05, -0.85), h + P(0, -0.12, -1.7), h + P(0, -0.22, -2.25)], [0.6, 0.42, 0.3], CREAM, ["Head"], seg=10, flat=(1.0, 0.8))
+    c.ellipsoid(h + P(0, -0.12, -2.35), (0.2, 0.14, 0.12), PAW, "Head", stud=False, smooth=True)
+    for s in (-1, 1):
+        c.eye(h + P(s * 0.45, 0.45, -1.0), 0.26, P(s * 0.6, 0.15, -1), "Head")
+        c.leaf(h + P(s * 0.55, 0.95, -0.3), P(s * 0.4, 1, 0.15), P(1, 0, 0), 1.6, 0.95, FUR2, "Head", thick=0.22, shape="blade")
+        c.leaf(h + P(s * 0.55, 1.02, -0.45), P(s * 0.4, 1, 0.15), P(1, 0, 0), 1.2, 0.55, PINK, "Head", thick=0.08, shape="blade")
+        c.spike(h + P(s * 0.9, 0.0, -0.6), h + P(s * 1.6, -0.35, -0.2), 0.4, CREAM, "Head", seg=6)   # cheek fluff
+        c.ellipsoid(h + P(s * 0.5, 0.8, -0.9), (0.28, 0.08, 0.12), FUR2, "Head", rot=euler(0, s * -20, s * 15))
+    c.ellipsoid(h + P(0, 0.85, -1.05), (0.18, 0.18, 0.08), GLOW, "Head", rot=euler(0, 0, 45), glow=True)   # forehead gem
+    # five fanned tails, each with its own two bones
+    root = P(0, sh + 0.3, k["hip_z"] + 1.0)
+    for i in range(5):
+        a = math.radians(-60 + i * 30)
+        d = P(math.sin(a) * 0.9, 0.75, 0.7)
+        m = root + d * 1.6
+        e = m + P(math.sin(a) * 1.6, 1.4, 0.9)
+        n1, n2 = "TailA%d" % (i + 1), "TailB%d" % (i + 1)
+        c.bone(n1, root, m, "Hips"); c.bone(n2, m, e, n1)
+        c.tube([root, root.lerp(m, 0.5) + P(0, 0.15, 0), m], [0.32, 0.55, 0.62], FUR, [n1], seg=10, paint=star)
+        c.tube([m, m.lerp(e, 0.5), e], [0.62, 0.55, 0.12], FUR2, [n2], seg=10, paint=star)
+        c.ellipsoid(e + (m - e) * 0.18, (0.4, 0.4, 0.4), GLOW if i % 2 else PINK, n2, glow=True)
+    aura(c, "orbit", (150, 110, 255), (120, 230, 255), "Cosmic")
+    return c
+
+
+def anims(c):
+    def extra(t, walking):
+        p = tau * t
+        out = {}
+        for i in range(5):
+            out["TailA%d" % (i + 1)] = (5 * sin(2 * p + i), (12 if walking else 9) * sin(p + i * 0.6), 0)
+            out["TailB%d" % (i + 1)] = (6 * sin(2 * p + i + 0.6), (14 if walking else 10) * sin(p + i * 0.6 - 0.8), 0)
+        return out
+    quad_anims(c, tail=0, stride=26, extra=extra)
+
+##### FILE: creature_pipeline/creatures/lionemperor.py #####
+"""LION EMPEROR (Divine, royal): golden lion with a huge layered shard mane, gold crown with sapphires,
+gold pauldrons and chest plate, a red royal cape with gold trim, glowing golden eyes and a roaring mouth."""
+from detail import *
+
+FUR, FUR2, CREAM, MANE, MANE2, MANE3, GOLD, GOLD2, GEM, CAPE, NOSE, CLAW = (
+    C(240, 186, 102), C(214, 152, 74), C(252, 228, 180), C(206, 104, 34), C(150, 62, 26), C(244, 150, 46),
+    C(255, 206, 60), C(214, 150, 30), C(70, 160, 255), C(186, 28, 48), C(70, 40, 35), C(250, 245, 230))
+
+
+def build():
+    c = detailed("LionEmperor", height=10)
+    k = beast(c, sh=3.85, hip=3.6, L=1.9, W=1.15, neck=(0.9, 0.9), head=1.6, tail=4, tail_len=0.95, tail_lift=0.2)
+    sh, hip, cz, hz, hb, mid = k["sh"], k["hip"], k["cz"], k["hz"], k["hb"], k["mid"]
+    TB = ["Hips", "Chest"]
+    T(c, [V(0, hip, hz + 0.8), V(0, hip, hz), V(0, mid.y, 0), V(0, sh, cz), V(0, sh + 0.2, cz - 0.5)], [0.8, 1.12, 1.15, 1.25, 1.05], FUR, TB, seg=9)
+    E(c, V(0, mid.y - 0.6, -0.3), (0.95, 0.5, 2.0), CREAM, TB)
+    # ---- royal cape over the back, gold chest plate, pauldrons
+    shell(c, V(0, mid.y + 0.05, 0.45), (1.32, 1.25, 1.9), CAPE, TB, th=(-180, 180), ph=(32, 90), seg=(12, 3), trim=GOLD, thick=0.12, inset=0.08)
+    for s in (-1, 1):
+        shell(c, V(0, mid.y + 0.05, 0.45), (1.32, 1.25, 1.9), CAPE, TB, th=(40, 140) if s > 0 else (-140, -40), ph=(-25, 34), seg=(6, 3), thick=0.1)
+        shell(c, V(0, mid.y + 0.05, 0.45), (1.36, 1.29, 1.94), GOLD, TB, th=(40, 140) if s > 0 else (-140, -40), ph=(-30, -22), seg=(6, 1), thick=0.1)
+    E(c, V(0, mid.y + 1.36, 0.45), (0.28, 0.12, 0.28), GEM, TB, seg=(8, 4), glow=True)
+    shell(c, V(0, sh - 0.25, cz - 0.3), (1.15, 1.18, 0.98), GOLD, "Chest", th=(-58, 58), ph=(-55, 30), trim=GOLD2)
+    BOX(c, V(0, sh - 0.25, cz - 1.42), (0.22, 0.22, 0.08), GEM, "Chest", rot=(0, 0, 45), glow=True)
+    # ---- legs with big paws, white claws, elbow tufts
+    for s, X in ((-1, "L"), (1, "R")):
+        for front in (True, False):
+            b = leg(c, k, X, FUR, r=(0.68, 0.52, 0.44) if front else (0.74, 0.52, 0.42), paw_col=FUR, paw=(0.66, 0.38, 0.85), front=front)
+            lo = "Fore" + X if front else "Shin" + X
+            ft = k["paw" + X] if front else k["foot" + X]
+            claws3(c, ft + V(0, 0, -0.15), CLAW, lo, size=0.26)
+            cuff(c, b.lerp(ft, 0.55), b.lerp(ft, 0.75), 0.45, GOLD, lo, thick=0.09, seg=8, flare=0.02)
+            fur_line(c, [b + V(0, 0.1, 0.2), b + V(0, -0.2, 0.35)], FUR2, lo, length=0.55, width=0.38, out=V(0, -0.4, 1), n_per=3, seed=41 + s + front)
+        sho = k["sho" + X]
+        shell(c, sho + V(s * 0.15, 0.35, 0), (0.85, 0.75, 0.95), GOLD, "Arm" + X, th=(20, 160) if s > 0 else (-160, -20), ph=(-10, 85), trim=GOLD2)
+        E(c, sho + V(s * 0.95, 0.55, 0), (0.1, 0.18, 0.18), GEM, "Arm" + X, seg=(6, 4), glow=True)
+        S(c, sho + V(s * 0.6, 1.0, 0), sho + V(s * 0.85, 1.55, 0.1), 0.18, GOLD2, "Arm" + X, stud=False)
+    # ---- head: skull, cream muzzle, roaring jaw, glowing eyes
+    T(c, [V(0, sh, cz), k["nb"], hb + V(0, -0.1, 0.2)], [1.05, 0.9, 0.75], FUR, ["Chest", "Neck"], seg=8)
+    E(c, hb + V(0, 0.0, -0.45), (0.86, 0.8, 0.86), FUR, "Head")
+    E(c, hb + V(0, -0.3, -1.15), (0.62, 0.42, 0.55), CREAM, "Head")
+    E(c, hb + V(0, 0.32, -0.95), (0.7, 0.2, 0.32), FUR2, "Head")
+    E(c, hb + V(0, -0.1, -1.62), (0.24, 0.16, 0.14), NOSE, "Head", stud=False)
+    for s in (-1, 1):
+        E(c, hb + V(s * 0.6, 0.62, -0.15), (0.24, 0.26, 0.15), FUR2, "Head")
+    E(c, hb + V(0, -0.98, -1.0), (0.5, 0.2, 0.6), CREAM, "Jaw", rot=(-12, 0, 0))
+    maw(c, hb + V(0, -0.62, -1.5), 0.42, 0.7, 0.55, "Head", "Jaw", n=8, tooth=0.17, fangs=2.2)
+    eyes_pair(c, hb + V(0, 0.15, -1.08), 0.38, 0.23, "Head", glow=C(255, 215, 50), core=C(255, 250, 200), brow=FUR2, slant=22, turn=0.4)
+    # ---- mane: two shard layers radiating out and back around the face
+    mc = hb + V(0, -0.1, -0.05)
+    rad_flow = lambda p, n: (p - mc).normalized() * 0.5 + V(0, -0.1, 1)
+    fur(c, mc, (1.45, 1.45, 1.05), MANE2, ["Neck", "Head"], n=170, length=1.35, width=0.72, flow=rad_flow, where=lambda u, p: u.z > -0.5, col2=MANE, mix=0.3, seed=43, lift=0.65)
+    fur(c, mc + V(0, 0, -0.25), (1.2, 1.2, 0.85), MANE3, ["Neck", "Head"], n=110, length=0.9, width=0.55, flow=rad_flow, where=lambda u, p: -0.62 < u.z < 0.2, col2=MANE, mix=0.4, seed=44, lift=0.8)
+    fur(c, k["nb"] + V(0, -0.2, 0.1), (1.15, 1.1, 1.0), MANE2, ["Chest", "Neck"], n=60, length=1.1, width=0.6, flow=V(0, -0.6, 0.6), where=lambda u, p: u.y < 0.2, col2=MANE, seed=45)
+    crown(c, hb + V(0, 0.98, -0.3), 0.55, 0.36, GOLD, "Head", n=5, gem=GEM, tall=1.7, tilt=(-8, 0, 0))
+    # ---- tail with a mane tuft and gold ring
+    tp = k["tail"]
+    T(c, tp, [0.3, 0.26, 0.22, 0.18, 0.14], FUR, ["Tail%d" % (i + 1) for i in range(4)], seg=7)
+    fur(c, tp[-1], (0.45, 0.45, 0.55), MANE2, "Tail4", n=36, length=0.75, width=0.45, flow=(tp[-1] - tp[-2]).normalized(), col2=MANE, seed=47, lift=0.6)
+    cuff(c, tp[-2].lerp(tp[-1], 0.3), tp[-2].lerp(tp[-1], 0.6), 0.2, GOLD, "Tail4", thick=0.08, seg=8)
+    aura(c, "sparkle", (255, 215, 60), (255, 255, 220), "Divine")
+    c.extra["speed"] = 1.0
+    return c
+
+
+def anims(c):
+    def extra(t, walking):
+        p = tau * t
+        if walking:
+            return {"Jaw": (-4 - 4 * max(0, sin(2 * p)), 0, 0)}
+        roar = max(0, sin(math.pi * (t - 0.5) / 0.32)) if 0.5 <= t <= 0.82 else 0.0
+        return {"Jaw": (-3 - 26 * roar, 0, 0), "Head": (14 * roar + 3 * sin(2 * p), 0, 4 * sin(p) * (1 - roar)), "Neck": (2 * sin(p) + 6 * roar, 14 * sin(p) * (1 - roar), 0)}
+    quad_anims(c, tail=4, stride=24, bob=0.12, head_amp=0.8, extra=extra)
+
+##### FILE: creature_pipeline/creatures/sentinelraptor.py #####
+"""SENTINEL RAPTOR (Secret, armoured): navy beast in white plate armour with steel trims, glowing blue
+joints and seams, a huge white blade crest with navy inlay, long jaw lined with teeth, ringed tail, hooked claws."""
+from detail import *
+
+NAVY, NAVY2, WHITE, STEEL, GLOW, CLAW = C(40, 50, 110), C(26, 32, 78), C(238, 241, 252), C(150, 165, 210), C(60, 175, 255), C(205, 210, 228)
+
+
+def build():
+    c = detailed("SentinelRaptor", height=10)
+    k = beast(c, sh=4.5, hip=4.0, L=1.7, W=1.15, neck=(1.3, 1.6), head=2.0, tail=5, tail_len=1.05, tail_lift=0.4)
+    sh, hip, cz, hz, hb = k["sh"], k["hip"], k["cz"], k["hz"], k["hb"]
+    TB = ["Hips", "Chest"]
+    ribs = stripes(NAVY2, "z", period=0.45, width=0.14, wobble=0.05)
+    # ---- body core (navy, ribbed) + belly
+    T(c, [V(0, hip + 0.05, hz + 0.9), V(0, hip, hz), V(0, (hip + sh) / 2, 0), V(0, sh, cz), V(0, sh + 0.2, cz - 0.5)], [0.8, 1.12, 1.2, 1.25, 1.0], NAVY, TB, seg=8, flat=(1.0, 1.1), paint=ribs)
+    # ---- back plates: overlapping armadillo bands with steel trims, glowing seams between them
+    for i in range(5):
+        t = i / 4
+        z = cz + 0.1 + (hz - cz + 0.3) * t
+        y = sh + (hip - sh) * t + 0.15
+        shell(c, V(0, y, z), (1.32 - 0.08 * abs(t - 0.4), 1.25, 0.62), WHITE, TB, th=(-180, 180), ph=(8, 90), off=0.02, thick=0.16, seg=(10, 3), trim=STEEL, inset=0.12)
+        for s in (-1, 1):
+            E(c, V(s * 1.18, y - 0.25, z + 0.48), (0.08, 0.14, 0.2), GLOW, TB, seg=(6, 4), glow=True)
+        S(c, V(0, y + 1.25, z), V(0, y + 1.85, z + 0.45), 0.2, WHITE, TB)
+    shell(c, V(0, sh - 0.3, cz - 0.25), (1.15, 1.15, 0.95), WHITE, "Chest", th=(-55, 55), ph=(-55, 35), off=0.04, thick=0.14, seg=(5, 4), trim=STEEL)
+    # ---- legs: navy, white armour shells, glowing joint rings, hooked claws
+    for s, X in ((-1, "L"), (1, "R")):
+        for front in (True, False):
+            b = leg(c, k, X, NAVY, r=(0.7, 0.52, 0.42) if front else (0.78, 0.56, 0.44), paw_col=WHITE, paw=(0.55, 0.32, 0.75), seg=7, front=front)
+            up, lo = ("Arm" + X, "Fore" + X) if front else ("Thigh" + X, "Shin" + X)
+            top = k["sho" + X] if front else k["hip" + X]
+            ft = k["paw" + X] if front else k["foot" + X]
+            shell(c, top + V(s * 0.12, 0.15, 0), (0.88, 0.95, 1.0), WHITE, up, th=(s * 20, s * 165) if s > 0 else (-165, -20), ph=(-25, 80), off=0.04, thick=0.16, seg=(6, 4), trim=STEEL)
+            cuff(c, b.lerp(ft, 0.18), b.lerp(ft, 0.75), 0.42, WHITE, lo, thick=0.14, seg=7, flare=0.1)
+            c.torus(B(b), 0.5, 0.09, GLOW, lo, rot=euler(0, 0, 90), seg=(12, 4), glow=True)
+            claws3(c, ft + V(0, 0, -0.1), CLAW, lo, size=0.36)
+    # ---- neck + head: long wedge skull, white helmet plate, navy jaw full of teeth, blade crest
+    T(c, [V(0, sh, cz), k["nb"], hb + V(0, -0.1, 0.2)], [1.0, 0.8, 0.62], NAVY, ["Chest", "Neck"], seg=8, paint=ribs)
+    fur_line(c, [k["nb"] + V(0, 0.75, 0.6), hb + V(0, 0.55, 0.3)], WHITE, "Neck", length=0.8, width=0.42, out=V(0, 1, 0.8), n_per=3, seed=21)
+    E(c, hb + V(0, -0.1, -0.7), (0.78, 0.6, 1.1), NAVY, "Head")
+    # angular helmet: diamond-section wedge from the crest base to a pointed snout + cheek plates
+    T(c, [hb + V(0, 0.42, 0.35), hb + V(0, 0.38, -0.7), hb + V(0, 0.12, -1.9), hb + V(0, -0.12, -2.75)], [0.82, 0.86, 0.62, 0.2], WHITE, "Head", seg=4, sub=1, flat=(1.0, 0.5), stud=False)
+    T(c, [hb + V(0, 0.5, 0.2), hb + V(0, 0.5, -1.2)], [0.3, 0.2], STEEL, "Head", seg=4, sub=1, flat=(0.5, 1.0), stud=False)
+    for s in (-1, 1):
+        SHEET(c, [hb + V(s * 0.72, 0.15, 0.2), hb + V(s * 0.74, 0.1, -1.1), hb + V(s * 0.62, -0.42, -0.9), hb + V(s * 0.66, -0.5, 0.15)], WHITE, "Head", thick=0.14, stud=False)
+        S(c, hb + V(s * 0.66, 0.1, 0.1), hb + V(s * 1.05, 0.25, 0.9), 0.16, STEEL, "Head")
+    E(c, hb + V(0, -0.98, -1.4), (0.5, 0.2, 1.0), NAVY, "Jaw", rot=(-14, 0, 0))
+    maw(c, hb + V(0, -0.5, -2.45), 0.46, 1.25, 0.6, "Head", "Jaw", n=11, tooth=0.22, fangs=1.5)
+    eyes_pair(c, hb + V(0, 0.02, -1.35), 0.6, 0.24, "Head", glow=GLOW, core=C(210, 245, 255), brow=None, slant=24, turn=0.85)
+    crest = [hb + V(0, 0.55, -0.9), hb + V(0, 1.6, -0.55), hb + V(0, 3.4, 0.4), hb + V(0, 2.4, 1.3), hb + V(0, 0.5, 0.45)]
+    SHEET(c, crest, WHITE, "Head", thick=0.22)
+    ctr = sum(crest, V(0, 0, 0)) / len(crest)
+    SHEET(c, [ctr + (p - ctr) * 0.55 + V(0, 0.15, 0) for p in crest], NAVY2, "Head", thick=0.3)
+    for s in (-1, 1):
+        S(c, hb + V(s * 0.45, 0.35, 0.2), hb + V(s * 0.9, 0.7, 1.0), 0.18, WHITE, "Head")
+    # ---- tail: navy core with white armour rings, blade tip
+    tp = k["tail"]
+    radii = [0.72, 0.58, 0.46, 0.36, 0.26, 0.14]
+    T(c, tp, radii, NAVY, ["Tail%d" % (i + 1) for i in range(5)], seg=7)
+    for i in range(5):
+        a, b = tp[i].lerp(tp[i + 1], 0.2), tp[i].lerp(tp[i + 1], 0.7)
+        cuff(c, a, b, radii[i] * 0.92, WHITE, "Tail%d" % (i + 1), thick=0.1, seg=7, flare=0.05)
+    S(c, tp[-1], tp[-1] + V(0, 0.2, 1.0), 0.22, WHITE, "Tail5")
+    aura(c, "sparkle", (60, 175, 255), (230, 240, 255), "Secret")
+    c.extra["speed"] = 1.1
+    return c
+
+
+def anims(c):
+    def extra(t, walking):
+        p = tau * t
+        if walking:
+            return {"Jaw": (-4 - 6 * max(0, sin(2 * p)), 0, 0), "Neck": (-6 * sin(2 * p), 0, 0)}
+        hiss = max(0, sin(math.pi * (t - 0.55) / 0.3)) if 0.55 <= t <= 0.85 else 0.0
+        return {"Jaw": (-3 - 24 * hiss, 0, 0), "Head": (10 * hiss + 3 * sin(2 * p), 0, 5 * sin(p))}
+    quad_anims(c, tail=5, stride=26, bob=0.14, head_amp=0.9, extra=extra)
+
+##### FILE: creature_pipeline/creatures/tyrantrex.py #####
+"""TYRANT REX (Godly, Prehistoric guardian + pet): massive forest-green T-Rex with dark tiger stripes,
+cream belly, bone-white back spikes, scarred brow ridges, a huge open jaw lined with teeth, tiny arms,
+glowing amber eyes and a molten-amber gem crest."""
+from dino import *
+
+GRN, GRN2, BELLY, BONE, CLAW, AMBER, AMBER2 = C(62, 120, 58), C(30, 64, 34), C(232, 214, 160), C(240, 232, 205), C(60, 50, 44), C(255, 170, 30), C(255, 230, 120)
+
+
+def build():
+    c = detailed("TyrantRex", height=12)
+    k = theropod(c, hip=5.0, L=2.3, W=1.25, neck=(1.0, 1.25), head=3.2, tail=6, tail_len=1.35, arm=0.75, upright=0.25)
+    hb, ch, mid, hip, hz = k["hb"], k["chest"], k["mid"], k["hip"], k["hz"]
+    stripes_ = stripes(GRN2, "z", period=0.75, width=0.2, wobble=0.35)
+    TB = ["Hips", "Chest"]
+    # ---- body: deep barrel chest tapering into the hips + cream belly
+    T(c, [V(0, hip + 0.1, hz + 1.0), V(0, hip + 0.2, hz), mid, ch + V(0, -0.2, 0.3), ch + V(0, 0.05, -0.35)],
+      [1.25, 1.6, 1.85, 1.75, 1.3], GRN, TB, seg=10, flat=(0.9, 1.05), paint=stripes_)
+    E(c, mid + V(0, -1.05, -0.3), (1.25, 0.9, 2.0), BELLY, TB, seg=(10, 7), paint=stripes(C(205, 185, 130), "y", period=0.35, width=0.08, wobble=0))
+    # ---- neck + head
+    T(c, [ch + V(0, 0.1, 0.2), k["nb"] + V(0, 0, -0.1), hb + V(0, -0.15, 0.25)], [1.35, 1.2, 1.05], GRN, ["Chest", "Neck"], seg=9, paint=stripes_)
+    E(c, k["nb"] + V(0, -0.7, -0.25), (0.9, 0.8, 0.9), BELLY, "Neck", seg=(8, 6))
+    # skull: boxy and deep, long snout
+    T(c, [hb + V(0, 0.2, 0.5), hb + V(0, 0.25, -0.6), hb + V(0, 0.1, -1.9), hb + V(0, -0.05, -3.0)], [1.05, 1.08, 0.88, 0.62],
+      GRN, "Head", seg=8, sub=1, flat=(0.9, 0.95), paint=stripes_)
+    E(c, hb + V(0, -0.05, -3.0), (0.62, 0.5, 0.45), GRN, "Head", seg=(8, 6))
+    # lower jaw, dropped open
+    T(c, [hb + V(0, -0.85, 0.2), hb + V(0, -1.4, -1.3), hb + V(0, -1.7, -2.75)], [0.85, 0.7, 0.5], GRN, "Jaw", seg=8, sub=1, flat=(0.95, 0.6))
+    E(c, hb + V(0, -1.65, -1.3), (0.65, 0.35, 1.3), BELLY, "Jaw", seg=(8, 6))
+    maw(c, hb + V(0, -1.05, -2.85), 0.58, 2.4, 0.6, "Head", "Jaw", n=13, tooth=0.34, fangs=1.5)
+    # brow ridges, nostrils, scars
+    for s in (-1, 1):
+        S(c, hb + V(s * 0.55, 0.85, -0.7), hb + V(s * 0.75, 1.25, 0.2), 0.22, GRN2, "Head", seg=4, n=3)
+        E(c, hb + V(s * 0.3, 0.32, -3.2), (0.12, 0.08, 0.1), C(20, 30, 20), "Head", stud=False)
+        T(c, [hb + V(s * 0.95, 0.4, -1.55), hb + V(s * 0.98, -0.05, -1.25)], [0.05, 0.05], BELLY, "Head", seg=4, stud=False)
+    eyes_pair(c, hb + V(0, 0.55, -0.85), 0.86, 0.34, "Head", glow=AMBER, core=AMBER2, brow=GRN2, slant=22, turn=0.95)
+    # amber crest gem + bone horns on the skull
+    E(c, hb + V(0, 1.15, -0.55), (0.32, 0.4, 0.45), AMBER, "Head", glow=True, seg=(6, 4))
+    for s in (-1, 1):
+        S(c, hb + V(s * 0.45, 0.9, 0.15), hb + V(s * 0.75, 1.5, 0.95), 0.25, BONE, "Head", bend=V(0, 0.2, 0), seg=4, n=4)
+    # ---- back spikes running from the skull down to the tail tip
+    pts = [hb + V(0, 0.95, 0.5), k["nb"] + V(0, 1.15, 0.2), ch + V(0, 1.6, 0.4), mid + V(0, 1.8, -0.4), mid + V(0, 1.85, 0.6), V(0, hip + 1.55, hz + 0.1)]
+    bones = ["Head", "Neck", "Chest", "Chest", "Hips", "Hips"]
+    for i, p in enumerate(pts):
+        sz = 0.42 if 1 < i < 5 else 0.3
+        S(c, p, p + V(0, sz * 1.7, sz * 0.7), sz * 0.5, BONE, bones[i], seg=4, n=3)
+    # ---- legs + arms + tail
+    theropod_legs(c, k, GRN, CLAW, r=(1.0, 0.68, 0.4), paint=stripes_, toe_col=GRN2)
+    tiny_arms(c, k, GRN, CLAW, r=0.3)
+    radii = dino_tail(c, k, GRN, 1.3, paint=stripes_)
+    tp = k["tail"]
+    for i in range(1, len(tp) - 1):
+        sz = 0.36 * (1 - i / len(tp)) + 0.1
+        S(c, tp[i] + V(0, radii[i] * 0.85, 0), tp[i] + V(0, radii[i] * 0.85 + sz * 1.6, sz * 0.7), sz * 0.5, BONE, "Tail%d" % (i + 1 if i < len(tp) - 1 else i), seg=4, n=3)
+    aura(c, "sparkle", (255, 170, 30), (255, 240, 180), "Godly")
+    c.extra["speed"] = 0.9
+    return c
+
+
+def anims(c):
+    theropod_anims(c, tail=6, stride=28, bob=0.22, head_amp=0.8)
+
+##### FILE: creature_pipeline/creatures/stormptero.py #####
+"""STORM PTERODACTYL (Omega, Prehistoric): hovering storm-grey pterosaur with violet membrane wings edged in
+glowing electric-yellow, a long swept-back crest, toothy beak, clawed feet tucked under it."""
+from dino import *
+
+GREY, GREY2, BELLY, SKIN, SKIN2, CREST, BONE, BOLT = C(96, 104, 128), C(56, 60, 80), C(225, 225, 235), C(120, 70, 190), C(80, 40, 140), C(255, 200, 40), C(235, 230, 215), C(255, 240, 80)
+
+
+def build():
+    c = detailed("StormPterodactyl", height=6)
+    c.bone("Root", P(0, 0, 0), P(0, 1, 0))
+    body0, body1 = V(0, 4.2, 0.9), V(0, 4.6, -0.9)
+    c.bone("Hips", B(body0), B((body0 + body1) / 2), "Root")
+    c.bone("Chest", B((body0 + body1) / 2), B(body1), "Hips")
+    nb = body1 + V(0, 0.2, -0.1)
+    hb = nb + V(0, 1.1, -0.6)
+    c.bone("Neck", B(nb), B(hb), "Chest")
+    c.bone("Head", B(hb), B(hb + V(0, 0, -2.0)), "Neck")
+    c.bone("Jaw", B(hb + V(0, -0.3, -0.2)), B(hb + V(0, -0.45, -2.2)), "Head")
+    wing_bones(c, (0.6, 4.7, -0.6), (3.2, 5.6, -0.2), (6.6, 5.2, 0.6))
+    for s, X in ((-1, "L"), (1, "R")):
+        c.bone("Thigh" + X, B(V(s * 0.45, 4.1, 0.7)), B(V(s * 0.55, 3.2, 1.0)), "Hips")
+        c.bone("Shin" + X, B(V(s * 0.55, 3.2, 1.0)), B(V(s * 0.55, 2.5, 1.4)), "Thigh" + X)
+    c.bone("Tail1", B(body0 + V(0, 0, 0.3)), B(body0 + V(0, -0.2, 1.4)), "Hips")
+    # body
+    T(c, [body0 + V(0, -0.05, 0.6), body0, body1, body1 + V(0, 0.15, -0.35)], [0.45, 0.78, 0.82, 0.55], GREY, ["Hips", "Chest"], seg=8, paint=stripes(GREY2, "z", period=0.45, width=0.1, wobble=0.3))
+    E(c, (body0 + body1) / 2 + V(0, -0.35, 0), (0.62, 0.45, 1.05), BELLY, ["Hips", "Chest"], seg=(8, 6))
+    fur_line(c, [body1 + V(0, 0.55, 0.2), nb + V(0, 0.45, 0.0)], GREY2, "Chest", length=0.55, width=0.3, out=V(0, 1, 0.6), n_per=3, seed=3)
+    T(c, [body1 + V(0, 0.1, 0.1), nb, hb + V(0, -0.1, 0.15)], [0.55, 0.45, 0.4], GREY, ["Chest", "Neck"], seg=7)
+    # head: long beak + big swept crest
+    T(c, [hb + V(0, 0.05, 0.35), hb + V(0, 0.1, -0.35), hb + V(0, -0.05, -1.3), hb + V(0, -0.2, -2.3)], [0.5, 0.5, 0.3, 0.08], GREY, "Head", seg=6, sub=1, flat=(0.8, 1.0))
+    T(c, [hb + V(0, -0.35, -0.15), hb + V(0, -0.45, -1.2), hb + V(0, -0.5, -2.1)], [0.32, 0.2, 0.06], GREY2, "Jaw", seg=6, sub=1, flat=(0.85, 0.6))
+    maw(c, hb + V(0, -0.28, -1.5), 0.17, 0.8, 0.22, "Head", "Jaw", n=7, tooth=0.1, fangs=1.2, tongue=False, inner=False)
+    crest = [hb + V(0, 0.35, -0.6), hb + V(0, 0.75, 0.1), hb + V(0, 1.2, 1.4), hb + V(0, 0.95, 1.7), hb + V(0, 0.35, 0.45)]
+    SHEET(c, crest, CREST, "Head", thick=0.16, stud=False)
+    T(c, [crest[1], crest[2]], [0.06, 0.04], BOLT, "Head", seg=4, glow=True)
+    eyes_pair(c, hb + V(0, 0.25, -0.35), 0.4, 0.2, "Head", glow=BOLT, core=C(255, 255, 220), brow=GREY2, slant=22, turn=0.9)
+    # wings
+    bat_wings(c, (0.6, 4.7, -0.6), (3.2, 5.6, -0.2), (6.6, 5.2, 0.6), GREY, SKIN, edge_col=BOLT, fingers=3, glow_edge=True)
+    for s, X in ((-1, "L"), (1, "R")):
+        m, t = V(s * 3.2, 5.6, -0.2), V(s * 6.6, 5.2, 0.6)
+        T(c, [m.lerp(t, 0.1) + V(0, 0.08, 0), t + V(0, 0.05, 0)], [0.07, 0.05], BOLT, "WingTip" + X, seg=4, glow=True)
+    # legs tucked + clawed feet
+    for s, X in ((-1, "L"), (1, "R")):
+        a, b, f = V(s * 0.45, 4.1, 0.7), V(s * 0.55, 3.2, 1.0), V(s * 0.55, 2.5, 1.4)
+        T(c, [a, b], [0.28, 0.18], GREY, "Thigh" + X, seg=6)
+        T(c, [b, f], [0.18, 0.12], GREY2, "Shin" + X, seg=6)
+        for j in (-1, 0, 1):
+            S(c, f, f + V(j * 0.2, -0.4, -0.25), 0.08, BONE, "Shin" + X, bend=V(0, 0.1, 0), seg=4, n=3, stud=False)
+    T(c, [body0 + V(0, 0, 0.3), body0 + V(0, -0.2, 1.4)], [0.2, 0.05], GREY, "Tail1", seg=5)
+    SHEET(c, [body0 + V(0, -0.2, 1.2), body0 + V(0.35, -0.2, 1.6), body0 + V(0, -0.2, 1.95), body0 + V(-0.35, -0.2, 1.6)], SKIN, "Tail1", thick=0.1, stud=False)
+    aura(c, "sparkle", (255, 240, 80), (120, 70, 190), "Omega")
+    c.extra["hover"] = 1
+    c.extra["speed"] = 1.2
+    return c
+
+
+def anims(c):
+    def mk(rate, flap):
+        def fn(t):
+            p = tau * t * rate
+            return {
+                "Root": ((6 * sin(p - 1.2), 0, 0), (0, 0.45 * sin(p - 1.2), 0)),
+                "Chest": (3 * sin(p), 0, 0),
+                "Neck": (-4 * sin(p + 0.8), 6 * sin(t * tau) if rate < 2 else 0, 0),
+                "Head": (5 * sin(p + 1.4), 0, 0),
+                "Jaw": (-4 - 6 * max(0, sin(t * tau * 2)), 0, 0),
+                "WingL": (0, 0, flap * sin(p)), "WingR": (0, 0, -flap * sin(p)),
+                "WingTipL": (0, 0, flap * 0.6 * sin(p - 0.7)), "WingTipR": (0, 0, -flap * 0.6 * sin(p - 0.7)),
+                "ThighL": (-12 + 4 * sin(p), 0, 0), "ThighR": (-12 + 4 * sin(p), 0, 0),
+                "ShinL": (18, 0, 0), "ShinR": (18, 0, 0),
+                "Tail1": (6 * sin(p - 1.5), 0, 0),
+            }
+        return fn
+    c.animate({"Walk": (24, 1.0, mk(2, 32)), "Idle": (40, 4.0, mk(3, 26))})
+
+##### FILE: ui_icons/make_icons.py #####
+"""Cartoon UI icons in the style of Kobe's icon set (thick dark outline, bevelled 3D edge, glossy gradient,
+diagonal shine streaks). Outputs 512px PNGs."""
+import cairosvg, os
+OUT = os.path.dirname(os.path.abspath(__file__))
+INK = "#160c07"
+_id = [0]
+
+
+def uid(p):
+    _id[0] += 1
+    return f"{p}{_id[0]}"
+
+
+def grad(c1, c2, x1=0, y1=0, x2=0, y2=1):
+    g = uid("g")
+    return g, f'<linearGradient id="{g}" x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}"><stop offset="0" stop-color="{c1}"/><stop offset="1" stop-color="{c2}"/></linearGradient>'
+
+
+def piece(d, top, bottom, side, depth=12, outline=13, shine=True, transform=""):
+    """a bevelled flat shape: dark side extruded down by `depth`, glossy top face, outline around both"""
+    defs, body = [], []
+    g, gd = grad(top, bottom)
+    defs.append(gd)
+    clip = uid("c")
+    defs.append(f'<clipPath id="{clip}"><path d="{d}"/></clipPath>')
+    t = f' transform="{transform}"' if transform else ""
+    body.append(f'<g{t}>')
+    # outline around top + side
+    body.append(f'<path d="{d}" transform="translate(0,{depth})" fill="{INK}" stroke="{INK}" stroke-width="{outline * 2}" stroke-linejoin="round"/>')
+    body.append(f'<path d="{d}" fill="{INK}" stroke="{INK}" stroke-width="{outline * 2}" stroke-linejoin="round"/>')
+    body.append(f'<path d="{d}" transform="translate(0,{depth})" fill="{side}"/>')
+    body.append(f'<path d="{d}" fill="url(#{g})"/>')
+    if shine:
+        body.append(f'<g clip-path="url(#{clip})" opacity="0.38">'
+                    f'<path d="M-40 150 L150 -40 L185 -40 L-5 150 Z" fill="#fff"/>'
+                    f'<path d="M20 230 L240 10 L262 10 L42 230 Z" fill="#fff"/>'
+                    f'<path d="M120 300 L330 90 L345 90 L135 300 Z" fill="#fff"/></g>')
+        # light rim on the top-left edge of the face
+        body.append(f'<path d="{d}" fill="none" stroke="#ffffff" stroke-opacity="0.45" stroke-width="5" clip-path="url(#{clip})" transform="translate(3,4)"/>')
+    body.append('</g>')
+    return defs, body
+
+
+def svg(parts, name):
+    defs, body = [], []
+    for d, b in parts:
+        defs += d; body += b
+    s = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="512" height="512"><defs>{"".join(defs)}</defs>{"".join(body)}</svg>'
+    open(os.path.join(OUT, name + ".svg"), "w").write(s)
+    cairosvg.svg2png(bytestring=s.encode(), write_to=os.path.join(OUT, name + ".png"), output_width=512, output_height=512)
+
+
+def ell(cx, cy, rx, ry):
+    return f"M{cx - rx} {cy} a{rx} {ry} 0 1 0 {2 * rx} 0 a{rx} {ry} 0 1 0 {-2 * rx} 0 Z"
+
+
+def rrect(x, y, w, h, r):
+    return f"M{x + r} {y} H{x + w - r} Q{x + w} {y} {x + w} {y + r} V{y + h - r} Q{x + w} {y + h} {x + w - r} {y + h} H{x + r} Q{x} {y + h} {x} {y + h - r} V{y + r} Q{x} {y} {x + r} {y} Z"
+
+
+# ---------- INDEX: blue book with white pages, red bookmark and a gold star
+book = [
+    piece(rrect(52, 58, 150, 150, 14), "#ffffff", "#c9d8ee", "#8ea3c4", depth=14, shine=False, transform="rotate(-8 128 128) translate(10,6)"),
+    piece(rrect(40, 40, 150, 150, 16), "#5ab8ff", "#1c64d8", "#123f8f", depth=10, transform="rotate(-8 128 128)"),
+    piece(rrect(40, 40, 30, 150, 10), "#2f7fe6", "#123f8f", "#0c2c66", depth=10, shine=False, transform="rotate(-8 128 128)"),
+    piece("M150 30 L176 30 L176 92 L163 80 L150 92 Z", "#ff5a5a", "#c41020", "#7d0710", depth=4, outline=8, shine=False, transform="rotate(-8 128 128)"),
+    piece("M125 82 L136 106 L162 108 L142 124 L149 150 L125 136 L101 150 L108 124 L88 108 L114 106 Z", "#fff27a", "#ffb400", "#b06a00", depth=5, outline=8, transform="rotate(-8 128 128)"),
+]
+svg(book, "Icon_Index")
+
+# ---------- EGGS: cream egg with blue / green / orange spots
+eggd = "M128 30 C178 30 208 112 208 154 C208 202 172 230 128 230 C84 230 48 202 48 154 C48 112 78 30 128 30 Z"
+spots = []
+for (cx, cy, rx, ry, c1, c2) in [(96, 118, 20, 24, "#6fd2ff", "#2a8de8"), (150, 92, 16, 18, "#8bf06a", "#34b52a"), (160, 160, 22, 20, "#ffb35a", "#f06a12"),
+                                  (104, 186, 16, 14, "#8bf06a", "#34b52a"), (130, 140, 10, 10, "#ff7aa8", "#e0306a")]:
+    spots.append(piece(ell(cx, cy, rx, ry), c1, c2, c2, depth=0, outline=5, shine=False))
+svg([piece(eggd, "#fffdf2", "#e9d8b0", "#b39a6a", depth=10)] + spots, "Icon_Eggs")
+
+# ---------- PETS: big orange paw print
+paw = [piece(ell(128, 160, 58, 48), "#ffbd6b", "#e66f12", "#9a420a", depth=10)]
+for (cx, cy, rx, ry) in [(62, 100, 22, 28), (102, 66, 24, 30), (154, 66, 24, 30), (194, 100, 22, 28)]:
+    paw.append(piece(ell(cx, cy, rx, ry), "#ffbd6b", "#e66f12", "#9a420a", depth=8))
+svg(paw, "Icon_Pets")
+
+# ---------- SPEED: red sneaker with white sole and laces
+sole = "M26 176 L222 176 Q236 176 234 190 Q232 204 216 204 L36 204 Q20 204 20 190 Q20 176 26 176 Z"
+upper = "M30 176 L44 96 Q48 82 62 86 L104 98 Q118 102 128 116 L150 134 L206 148 Q230 156 228 176 Z"
+laces = "".join("")
+shoe = [piece(upper, "#ff6a5a", "#d2141e", "#86080e", depth=6),
+        piece(sole, "#ffffff", "#cfd6e2", "#8a93a6", depth=8, shine=False)]
+for i, (x, y) in enumerate([(96, 112), (112, 122), (128, 134)]):
+    shoe.append(piece(rrect(x - 4, y - 14, 30, 9, 4), "#ffffff", "#dfe5ef", "#9aa3b5", depth=2, outline=5, shine=False, transform=f"rotate(28 {x} {y})"))
+shoe.append(piece("M40 150 L86 150 L80 164 L36 164 Z", "#ffffff", "#e5e9f2", "#9aa3b5", depth=2, outline=5, shine=False))
+svg(shoe, "Icon_Speed")
+
+# ---------- CASH: stack of green bills
+cash = []
+for i, (dx, dy, rot) in enumerate([(10, 40, -12), (0, 20, -6), (-6, 0, 2)]):
+    t = f"translate({dx},{dy}) rotate({rot} 128 120)"
+    cash.append(piece(rrect(34, 78, 188, 96, 12), "#8ef06a", "#2fb33a", "#16701f", depth=8, transform=t))
+    cash.append(piece(ell(128, 126, 26, 26), "#e8ffd2", "#9ee082", "#4f9a3c", depth=0, outline=6, shine=False, transform=t))
+    cash.append((["" ], [f'<g transform="{t}"><path d="M139 113 Q128 105 119 112 Q111 121 128 126 Q145 131 138 141 Q128 149 116 141" fill="none" stroke="#14531a" stroke-width="7" stroke-linecap="round"/><path d="M128 102 V150" stroke="#14531a" stroke-width="6" stroke-linecap="round"/></g>']))
+svg(cash, "Icon_Cash")
+
+# ---------- CODES: blue rounded badge with a white tick
+check = [piece(ell(128, 120, 92, 92), "#5fc4ff", "#1360d8", "#0b3a8a", depth=12),
+         piece("M80 122 L106 96 L122 112 L164 66 L190 92 L122 162 Z", "#ffffff", "#dde8f6", "#8fa4c4", depth=6, outline=8, shine=False)]
+svg(check, "Icon_Codes")
+
+# ---------- POWERS: yellow lightning bolt
+bolt = [piece("M150 20 L58 140 L118 140 L92 236 L198 100 L136 100 L170 20 Z", "#fff27a", "#ffae00", "#a85f00", depth=12)]
+svg(bolt, "Icon_Powers")
+print("done")
+
+# ---------- BAT: wooden baseball bat, diagonal, dark grip
+import math
+def batpath():
+    # along the x axis from handle (x=30) to barrel end (x=226), then rotated -45 deg about the centre
+    return "M30 120 L120 116 Q170 102 214 104 Q232 106 232 128 Q232 150 214 152 Q170 154 120 140 L30 136 Q22 128 30 120 Z"
+bat = [piece(batpath(), "#ffd38a", "#c47a2c", "#7a4414", depth=10, transform="rotate(-42 128 128)"),
+       piece("M26 116 L76 116 L76 140 L26 140 Q18 128 26 116 Z", "#5a4a6a", "#2c2236", "#18121e", depth=10, shine=False, transform="rotate(-42 128 128)"),
+       piece(ell(22, 128, 9, 16), "#7a6a8a", "#3a2e46", "#18121e", depth=6, outline=8, shine=False, transform="rotate(-42 128 128)")]
+svg(bat, "Icon_Bat")
+
+# ---------- TRAP: steel bear trap, open jaws with teeth
+teeth = []
+n = 14
+ring_out = []
+for i in range(n * 2):
+    a = math.pi * 2 * i / (n * 2)
+    r = 104 if i % 2 == 0 else 80
+    ring_out.append((128 + r * math.cos(a), 136 + r * 0.78 * math.sin(a)))
+outer = "M" + " L".join(f"{x:.1f} {y:.1f}" for x, y in ring_out) + " Z"
+trap = [piece(outer, "#e6ecf5", "#8a96aa", "#4a5466", depth=12),
+        piece(ell(128, 136, 62, 48), "#4a5466", "#2a3140", "#1a1f2a", depth=0, outline=8, shine=False),
+        piece(ell(128, 136, 26, 20), "#ffd34a", "#e08a00", "#8a5200", depth=6, outline=8),
+        piece("M60 136 L196 136 L196 146 L60 146 Z", "#c9d2e0", "#7c879a", "#4a5466", depth=4, outline=6, shine=False)]
+svg(trap, "Icon_Trap")
+
+##### FILE: ui_icons/make_studs.py #####
+"""Generate seamless stud tiles that match the box icons (square inset studs).
+Output is black/white on transparent, so it overlays any coloured panel in Roblox."""
+import sys
+from PIL import Image, ImageDraw, ImageFilter
+
+OUT = sys.argv[1]
+S = 4  # supersample factor
+
+
+def rounded(draw, box, r, fill):
+    draw.rounded_rectangle(box, radius=r, fill=fill)
+
+
+def square_stud(tile=128, stud=86, radius=10, edge=9):
+    T, st, r, e = tile * S, stud * S, radius * S, edge * S
+    o = (T - st) // 2
+    img = Image.new("RGBA", (T, T), (0, 0, 0, 0))
+
+    # soft dark inset body (slightly darker than the panel)
+    body = Image.new("RGBA", (T, T), (0, 0, 0, 0))
+    rounded(ImageDraw.Draw(body), (o, o, o + st, o + st), r, (0, 0, 0, 34))
+    img.alpha_composite(body)
+
+    # dark shading on the top + left inner edges (light comes from bottom-right, like the icons)
+    shade = Image.new("L", (T, T), 0)
+    d = ImageDraw.Draw(shade)
+    rounded(d, (o, o, o + st, o + st), r, 255)
+    rounded(d, (o + e, o + e, o + st + e, o + st + e), r, 0)
+    dark = Image.new("RGBA", (T, T), (0, 0, 0, 120))
+    dark.putalpha(shade.point(lambda v: v * 120 // 255))
+    img.alpha_composite(dark)
+
+    # light rim on the bottom + right inner edges
+    rim = Image.new("L", (T, T), 0)
+    d = ImageDraw.Draw(rim)
+    rounded(d, (o, o, o + st, o + st), r, 255)
+    rounded(d, (o - e // 2, o - e // 2, o + st - e // 2, o + st - e // 2), r, 0)
+    light = Image.new("RGBA", (T, T), (255, 255, 255, 0))
+    light.putalpha(rim.point(lambda v: v * 95 // 255))
+    img.alpha_composite(light)
+
+    img = img.filter(ImageFilter.GaussianBlur(S * 0.6))
+    return img.resize((tile, tile), Image.LANCZOS)
+
+
+def round_stud(tile=128, stud=78, edge=9):
+    T, st, e = tile * S, stud * S, edge * S
+    o = (T - st) // 2
+    img = Image.new("RGBA", (T, T), (0, 0, 0, 0))
+    # drop shadow down-right
+    sh = Image.new("RGBA", (T, T), (0, 0, 0, 0))
+    ImageDraw.Draw(sh).ellipse((o + e, o + e, o + st + e, o + st + e), fill=(0, 0, 0, 90))
+    img.alpha_composite(sh.filter(ImageFilter.GaussianBlur(S * 2)))
+    # stud top
+    ImageDraw.Draw(img).ellipse((o, o, o + st, o + st), fill=(255, 255, 255, 40))
+    # highlight crescent top-left
+    hl = Image.new("L", (T, T), 0)
+    d = ImageDraw.Draw(hl)
+    d.ellipse((o, o, o + st, o + st), fill=255)
+    d.ellipse((o + e, o + e, o + st + e, o + st + e), fill=0)
+    white = Image.new("RGBA", (T, T), (255, 255, 255, 0))
+    white.putalpha(hl.point(lambda v: v * 150 // 255))
+    img.alpha_composite(white)
+    return img.filter(ImageFilter.GaussianBlur(S * 0.6)).resize((tile, tile), Image.LANCZOS)
+
+
+def preview(tiles, path):
+    colours = [(235, 40, 60), (230, 40, 160), (70, 60, 230), (60, 200, 70), (255, 190, 30)]
+    W = 260
+    out = Image.new("RGBA", (W * len(colours), W * len(tiles)), (40, 40, 40, 255))
+    for row, t in enumerate(tiles):
+        small = t.resize((40, 40), Image.LANCZOS)
+        for col, c in enumerate(colours):
+            panel = Image.new("RGBA", (W - 10, W - 10), c + (255,))
+            for y in range(0, W, 40):
+                for x in range(0, W, 40):
+                    panel.alpha_composite(small, (x, y)) if x + 40 <= W - 10 and y + 40 <= W - 10 else None
+            out.alpha_composite(panel, (col * W + 5, row * W + 5))
+    out.save(path)
+
+
+sq = square_stud()
+rd = round_stud()
+sq.save(f"{OUT}/Stud_Square_Tile.png")
+rd.save(f"{OUT}/Stud_Round_Tile.png")
+preview([sq, rd], f"{OUT}/stud_preview.png")
+print("ok")
+
