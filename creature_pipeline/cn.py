@@ -289,3 +289,19 @@ def dragon_head(c, hb, s, col, belly, horn, whisk, mane, glow, bone="Head", jaw=
     if beard is not None:
         fur_line(c, [hb + V(-0.35 * s, -0.75 * s, -1.4 * s), hb + V(0.35 * s, -0.75 * s, -1.4 * s)], beard, jaw, length=0.7 * s, width=0.4 * s, out=V(0, -1, 0.2), n_per=4, seed=seed + 1)
     return dict(nose=hb + V(0, 0, -2.4 * s * sn), top=hb + V(0, 0.9 * s, -0.5 * s))
+
+
+def scale_paint(col, size=0.55, width=0.08, only=None):
+    """overlapping fish / dragon scale arcs painted on (rows along z, offset every other row)"""
+    def mask(X, Y, Z):
+        b = (Y + X * 0.35) / size
+        row = np.floor(b)
+        a = Z / size + 0.5 * np.mod(row, 2)
+        fx = a - np.floor(a) - 0.5
+        fy = b - row
+        d = np.sqrt(fx * fx + fy * fy)
+        m = np.abs(d - 0.5) < width
+        if only is not None:
+            m &= only(X, Y, Z)
+        return m
+    return (col, mask)
