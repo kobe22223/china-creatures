@@ -225,3 +225,23 @@ def puffs(c, ctr, rad, col, bones, n=40, size=0.42, where=None, seed=3, sink=0.4
         p = ctr + P(u[0] * (rad[0] - s * sink), u[1] * (rad[1] - s * sink), u[2] * (rad[2] - s * sink))
         cc = col2 if (col2 is not None and rng.random() < mix) else col
         c.ellipsoid(p, (s, s * 0.9, s), cc, bones, seg=(10, 7), paint=paint)
+
+
+# ============================================================== SWIMMER (cute fish / dolphin, floats)
+def cute_swimmer(c, y0=2.2, head_r=1.1, body=(1.0, 1.0, 1.3), length=4.2, n=4, fins=True):
+    """floating swimmer skeleton: Root, Head (front), Spine1..n along +z (back), FinL/R at the sides of Spine1.
+    Returns dict with spine points (P vectors), chain names, head centre. Shapes are left to the creature."""
+    c.bone("Root", P(0, 0, 0), P(0, 1, 0))
+    z0 = -0.2
+    pts = [P(0, y0, z0 + length * i / n) for i in range(n + 1)]
+    chain = spine(c, pts, parent="Root")
+    hc = P(0, y0 + 0.05, z0 - head_r * 0.55)
+    c.bone("Head", P(0, y0, z0), hc + P(0, 0, -head_r), "Spine1")
+    if fins:
+        for s, S in ((-1, "L"), (1, "R")):
+            c.bone("Fin" + S, P(s * body[0] * 0.8, y0 - 0.3, z0 + 0.3), P(s * (body[0] + 0.9), y0 - 0.6, z0 + 0.8), "Spine1")
+    return dict(y0=y0, pts=pts, chain=chain, head=hc, head_r=head_r, z0=z0)
+
+
+def swimmer_anims(c, chain, amp=10, axis="yaw", hover=0.35, fins=True, extra=None):
+    swim_anims(c, chain, fins=[("FinL", -1), ("FinR", 1)] if fins else (), amp=amp, axis=axis, hover=hover, extra=extra)
