@@ -368,3 +368,49 @@ def serpent_anims(c, names, amp=10, hover=0.6, extra=None):
             out.update(extra(t, walking))
         return out
     swim_anims(c, names, amp=amp, axis="yaw", hover=hover, extra=ex)
+
+
+# ============================================================== FLYING BIRD (spread wings, hovers)
+def flying_bird(c, col, belly, leg_col, wing_col, tip_col, body=(1.2, 1.15, 1.4), head_r=1.0, y_lift=1.6,
+                span=(1.0, 2.6, 4.4), n_feathers=10, feather_len=(1.6, 1.2), cover=None, tail=2):
+    """cute_bird body lifted into the air with big spread feathered wings (WingL/R + WingTipL/R bones).
+    Legs stay short and tucked. Returns the cute_bird key dict."""
+    k = cute_bird(c, col, belly=belly, leg_col=leg_col, body=body, leg_h=0.8, head_r=head_r, head_up=1.05, head_fwd=0.5,
+                  wing_col=wing_col, tail=tail, foot="toes")
+    # drop the folded wings (shapes + bones), add spread wings instead
+    c.shapes = [sh for sh in c.shapes if not (set(sh["bones"]) <= {"WingL", "WingR"})]
+    c.bones = [b for b in c.bones if b[0] not in ("WingL", "WingR")]
+    # lift the whole bird (short tucked legs included) into the air; Root stays on the ground
+    up = P(0, y_lift, 0)
+    for sh in c.shapes:
+        bmesh.ops.translate(sh["bm"], vec=up, verts=sh["bm"].verts)
+    c.bones = [(n, h, t, p) if n == "Root" else (n, h + up, t + up, p) for n, h, t, p in c.bones]
+    k["by"] += y_lift
+    k["head"] = k["head"] + up
+    k["nb"] = k["nb"] + up
+    by, rx = k["by"], body[0]
+    root, mid, tip = (rx * 0.75, by + 0.35, -0.1), (span[1], by + 1.1, 0.2), (span[2], by + 0.9, 0.7)
+    wing_bones(c, root, mid, tip)
+    feather_wings(c, root, mid, tip, wing_col, tip_col, cover=cover or col, n=n_feathers, length=feather_len, width=0.9, arm_col=wing_col)
+    k["wing"] = (root, mid, tip)
+    return k
+
+
+def flyer_anims(c, flap=30, tail=2, extra=None):
+    def mk(rate, fl, walking):
+        def fn(t):
+            p = tau * t * rate
+            out = {
+                "Root": ((5 * sin(p - 1.2), 0, 0), (0, 0.4 * sin(p - 1.2), 0)),
+                "Chest": (3 * sin(p), 0, 0), "Neck": (-3 * sin(p + 0.8), 0, 0), "Head": (4 * sin(p + 1.4), 0, 6 * sin(t * tau)),
+                "WingL": (0, 0, fl * sin(p)), "WingR": (0, 0, -fl * sin(p)),
+                "WingTipL": (0, 0, fl * 0.6 * sin(p - 0.7)), "WingTipR": (0, 0, -fl * 0.6 * sin(p - 0.7)),
+                "ThighL": (-25, 0, 0), "ThighR": (-25, 0, 0), "ShinL": (30, 0, 0), "ShinR": (30, 0, 0),
+            }
+            for i in range(tail):
+                out["Tail%d" % (i + 1)] = (6 * sin(p - 1.5 - i * 0.5), 0, 0)
+            if extra:
+                out.update(extra(t, walking))
+            return out
+        return fn
+    c.animate({"Walk": (24, 1.0, mk(3, flap, True)), "Idle": (40, 4.0, mk(4, flap * 0.75, False))})
