@@ -305,3 +305,66 @@ def scale_paint(col, size=0.55, width=0.08, only=None):
             m &= only(X, Y, Z)
         return m
     return (col, mask)
+
+
+# ============================================================== SERPENTINE DRAGON (Kobe's rules)
+def serpent_dragon(c, col, belly, mane, claw_col, horn, whisk, glow, L=10.0, n=6, y0=4.0, wave=0.9, rise=0.6,
+                   head_scale=None, paint=None, horns="antler", fins=None, legs=True, mane_n=3, seed=1, brow=None, core=C(255, 250, 220)):
+    """long floating Chinese dragon: body thickness about 1/8 of its length, head about twice the body width,
+    short clawed legs, whiskers and a fur_line mane. Bones: Root, Spine1..n, Head, Jaw, ArmL/R, ThighL/R.
+    Animate with swim_anims (yaw) + hover. Returns dict with spine points (game Vectors) and radius."""
+    from detail import V, B, T, E, fur_line, claws3, S
+    R = L / 16.0                                     # body radius -> thickness = L/8
+    pts = []
+    for i in range(n + 1):
+        t = i / n
+        pts.append(V(wave * math.sin(t * math.tau * 1.1), y0 + rise * math.sin(t * math.tau * 0.9 + 0.6) - 0.4 * t, t * L))
+    c.bone("Root", P(0, 0, 0), P(0, 1, 0))
+    names = spine(c, [B(p) for p in pts], parent="Root")
+    hs = head_scale or (2 * R * 2) / (1.9)           # skull width (1.9 s) = twice the body width (4R)
+    hb = pts[0] + V(0, 0.25 * hs, -0.35 * hs)
+    c.bone("Head", B(pts[0]), B(hb + V(0, 0.1, -2.2 * hs)), "Spine1")
+    c.bone("Jaw", B(hb + V(0, -0.4 * hs, -0.3 * hs)), B(hb + V(0, -0.6 * hs, -2.2 * hs)), "Head")
+    radii = [R * (1.05 - 0.75 * (i / n) ** 1.6) for i in range(n + 1)]
+    T(c, pts, radii, col, names, seg=12, paint=paint)
+    T(c, [pts[0] + V(0, 0, 0.3), hb + V(0, -0.1 * hs, 0.1)], [R * 1.05, R * 1.0], col, ["Spine1", "Head"], seg=12, sub=1, paint=paint)
+    # belly plates: a lighter strip under the body
+    for i in range(n):
+        for j in range(3):
+            p = pts[i].lerp(pts[i + 1], (j + 0.5) / 3)
+            rr = radii[i] + (radii[i + 1] - radii[i]) * (j + 0.5) / 3
+            E(c, p + V(0, -rr * 0.62, 0), (rr * 0.72, rr * 0.4, L / n / 3 * 0.6), belly, names[i], seg=(8, 5))
+    # mane along the spine
+    for i in range(n - 1):
+        fur_line(c, [pts[i] + V(0, radii[i] * 0.85, 0), pts[i + 1] + V(0, radii[i + 1] * 0.85, 0)], mane, names[i], length=R * 1.6 * (1 - 0.4 * i / n),
+                 width=R * 0.9, out=V(0, 1, 0.7), n_per=mane_n, seed=seed + i)
+    if fins is not None:
+        for i in range(1, n):
+            S(c, pts[i] + V(0, radii[i] * 0.9, 0), pts[i] + V(0, radii[i] * 0.9 + R * 1.2, R * 0.8), R * 0.5, fins, names[i], seg=4, n=3)
+    # short clawed legs: front pair on Spine1, back pair on Spine(n-2)
+    if legs:
+        for li, (si, nm) in enumerate(((1, "Arm"), (n - 2, "Thigh"))):
+            p = pts[si]
+            for s, X in ((-1, "L"), (1, "R")):
+                a = p + V(s * radii[si] * 0.8, -radii[si] * 0.2, 0)
+                f = a + V(s * R * 0.9, -R * 1.5, -R * 0.5)
+                c.bone(nm + X, B(a), B(f), names[si])
+                T(c, [a, a.lerp(f, 0.5) + V(s * 0.1, 0.1, 0), f], [R * 0.45, R * 0.4, R * 0.32], col, nm + X, seg=8)
+                E(c, f, (R * 0.42, R * 0.25, R * 0.5), col, nm + X, seg=(8, 5))
+                claws3(c, f + V(0, 0.1, R * 0.2), claw_col, nm + X, size=R * 0.35, spread=R * 0.3, z=-R * 0.6)
+    k = dragon_head(c, hb, hs, col, belly, horn, whisk, mane, glow, bone="Head", jaw="Jaw", horns=horns, seed=seed + 1, brow=brow, core=core)
+    # tail tuft
+    fur_line(c, [pts[-2], pts[-1]], mane, names[-1], length=R * 1.4, width=R * 0.8, out=V(0, 0.6, 1), n_per=5, seed=seed + 2)
+    return dict(pts=pts, radii=radii, names=names, hb=hb, hs=hs, R=R)
+
+
+def serpent_anims(c, names, amp=10, hover=0.6, extra=None):
+    def ex(t, walking):
+        p = tau * t
+        out = {"ArmL": (20 * sin(2 * p), 0, 0), "ArmR": (-20 * sin(2 * p), 0, 0),
+               "ThighL": (-20 * sin(2 * p), 0, 0), "ThighR": (20 * sin(2 * p), 0, 0),
+               "Jaw": (-4 - (8 if walking else 14) * max(0, sin(2 * p)), 0, 0), "Head": (4 * sin(2 * p), 0, 0)}
+        if extra:
+            out.update(extra(t, walking))
+        return out
+    swim_anims(c, names, amp=amp, axis="yaw", hover=hover, extra=ex)
