@@ -4,3 +4,5 @@ creature_pipeline/out/*
 !creature_pipeline/out/batches/
 !creature_pipeline/out/textures/
 !creature_pipeline/out/CreatureData.rbxmx
+!creature_pipeline/out/treadmills/
+creature_pipeline/out/treadmills/china*/

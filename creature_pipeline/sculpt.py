@@ -382,7 +382,7 @@ class Creature:
             mod = ob.modifiers.new("Armature", "ARMATURE")
             mod.object = arm
             self.mesh_objs[gname] = ob
-        self._texture(outdir)
+        self._texture(outdir, getattr(self, "tex_size", 2048))
         return self
 
     # ---------------------------------------------------------------- texture
