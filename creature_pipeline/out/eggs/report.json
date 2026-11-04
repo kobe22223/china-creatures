@@ -1,4 +1,104 @@
 {
+ "China_Z01_Egg": {
+  "tris": 968,
+  "budget": 3000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z01_BigEgg": {
+  "tris": 2286,
+  "budget": 5000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z01_GiantEgg": {
+  "tris": 4680,
+  "budget": 8000,
+  "ok": true,
+  "glow": [
+   "China_Z01_GiantEgg_Glow_ffcd50"
+  ]
+ },
+ "China_Z02_Egg": {
+  "tris": 952,
+  "budget": 3000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z02_BigEgg": {
+  "tris": 2194,
+  "budget": 5000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z02_GiantEgg": {
+  "tris": 4196,
+  "budget": 8000,
+  "ok": true,
+  "glow": [
+   "China_Z02_GiantEgg_Glow_5affa0"
+  ]
+ },
+ "China_Z03_Egg": {
+  "tris": 1108,
+  "budget": 3000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z03_BigEgg": {
+  "tris": 2216,
+  "budget": 5000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z03_GiantEgg": {
+  "tris": 4564,
+  "budget": 8000,
+  "ok": true,
+  "glow": [
+   "China_Z03_GiantEgg_Glow_ffbe5a"
+  ]
+ },
+ "China_Z04_Egg": {
+  "tris": 1166,
+  "budget": 3000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z04_BigEgg": {
+  "tris": 2112,
+  "budget": 5000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z04_GiantEgg": {
+  "tris": 4734,
+  "budget": 8000,
+  "ok": true,
+  "glow": [
+   "China_Z04_GiantEgg_Glow_ff8228"
+  ]
+ },
+ "China_Z05_Egg": {
+  "tris": 984,
+  "budget": 3000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z05_BigEgg": {
+  "tris": 2210,
+  "budget": 5000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z05_GiantEgg": {
+  "tris": 4816,
+  "budget": 8000,
+  "ok": true,
+  "glow": [
+   "China_Z05_GiantEgg_Glow_5af0e6"
+  ]
+ },
  "China_Z06_Egg": {
   "tris": 888,
   "budget": 3000,
@@ -19,6 +119,46 @@
    "China_Z06_GiantEgg_Glow_ffbe5a"
   ]
  },
+ "China_Z07_Egg": {
+  "tris": 1146,
+  "budget": 3000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z07_BigEgg": {
+  "tris": 2794,
+  "budget": 5000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z07_GiantEgg": {
+  "tris": 5464,
+  "budget": 8000,
+  "ok": true,
+  "glow": [
+   "China_Z07_GiantEgg_Glow_ff6e28"
+  ]
+ },
+ "China_Z08_Egg": {
+  "tris": 888,
+  "budget": 3000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z08_BigEgg": {
+  "tris": 2160,
+  "budget": 5000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z08_GiantEgg": {
+  "tris": 3958,
+  "budget": 8000,
+  "ok": true,
+  "glow": [
+   "China_Z08_GiantEgg_Glow_ffd764"
+  ]
+ },
  "China_Z09_Egg": {
   "tris": 934,
   "budget": 3000,
@@ -37,6 +177,48 @@
   "ok": true,
   "glow": [
    "China_Z09_GiantEgg_Glow_a0d2ff"
+  ]
+ },
+ "China_Z10_Egg": {
+  "tris": 924,
+  "budget": 3000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z10_BigEgg": {
+  "tris": 2132,
+  "budget": 5000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z10_GiantEgg": {
+  "tris": 4312,
+  "budget": 8000,
+  "ok": true,
+  "glow": [
+   "China_Z10_GiantEgg_Glow_5af0e6",
+   "China_Z10_GiantEgg_Glow_64ffe6"
+  ]
+ },
+ "China_Z11_Egg": {
+  "tris": 958,
+  "budget": 3000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z11_BigEgg": {
+  "tris": 2684,
+  "budget": 5000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z11_GiantEgg": {
+  "tris": 4272,
+  "budget": 8000,
+  "ok": true,
+  "glow": [
+   "China_Z11_GiantEgg_Glow_ffeb96",
+   "China_Z11_GiantEgg_Glow_50ffaa"
   ]
  }
 }
