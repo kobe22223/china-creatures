@@ -1,0 +1,42 @@
+{
+ "China_Z06_Egg": {
+  "tris": 888,
+  "budget": 3000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z06_BigEgg": {
+  "tris": 2076,
+  "budget": 5000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z06_GiantEgg": {
+  "tris": 4736,
+  "budget": 8000,
+  "ok": true,
+  "glow": [
+   "China_Z06_GiantEgg_Glow_ffbe5a"
+  ]
+ },
+ "China_Z09_Egg": {
+  "tris": 934,
+  "budget": 3000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z09_BigEgg": {
+  "tris": 2010,
+  "budget": 5000,
+  "ok": true,
+  "glow": []
+ },
+ "China_Z09_GiantEgg": {
+  "tris": 4238,
+  "budget": 8000,
+  "ok": true,
+  "glow": [
+   "China_Z09_GiantEgg_Glow_a0d2ff"
+  ]
+ }
+}

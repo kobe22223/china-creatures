@@ -6,3 +6,6 @@ creature_pipeline/out/*
 !creature_pipeline/out/CreatureData.rbxmx
 !creature_pipeline/out/treadmills/
 creature_pipeline/out/treadmills/china*/
+!creature_pipeline/out/eggs/
+creature_pipeline/out/eggs/log*.txt
+creature_pipeline/out/eggs/sheets/_*
